@@ -21,6 +21,21 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
   * **Network Connections:** Tracks active TCP endpoints per process.
 * **System Tools:** Windows services viewer, startup applications optimizer, environment variables inspector, and installed software manager with uninstaller execution.
 
+## Gallery
+
+<tr>
+    <td align="center" width="50%">
+      <img src="https://github.com/user-attachments/assets/1035db68-910b-49d0-b579-a6c65264afd4" alt="Process Inspector" /><br/>
+      <sub><b>Advanced Process Inspector</b><br/><i>Virtual Memory, Modules, & TCP Endpoints</i></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="https://github.com/user-attachments/assets/46f55bd0-3fee-4b79-af03-9932670f24ea" alt="DLL Viewer" /><br/>
+      <sub><b>DLL Dependency Viewer</b><br/><i>Native PE Headers & Export Symbols</i></sub>
+    </td>
+  </tr>
+</table>
+
+
 ## Known Areas for Improvement (Learning In Progress)
 
 As an intermediate-to-advanced C++ learning project, several components are actively being refactored for better robustness:
