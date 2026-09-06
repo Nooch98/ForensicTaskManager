@@ -30,7 +30,7 @@ $sources = @(
 $output = "ForensicTaskManager.exe"
 $includes = "-Iimgui", "-I."
 
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi"
+$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi"
 
 Write-Host "[INFO] Compiling source code and linking Win32 / OpenGL libraries..." -ForegroundColor Yellow
 
