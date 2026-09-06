@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Build script for Nexus Task Manager
+    Build script for Forensic Task Manager
 #>
 
 Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "   Building Nexus Task Manager (Win32)   " -ForegroundColor Cyan
+Write-Host " Building Forensic Task Manager (Win32) " -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
 
 # Check if g++ is available in the system PATH
@@ -18,6 +18,7 @@ Write-Host "[INFO] Preparing source files and backend configurations..." -Foregr
 
 $sources = @(
     "taskmanager.cpp",
+    "app.res",
     "imgui/imgui.cpp",
     "imgui/imgui_draw.cpp",
     "imgui/imgui_tables.cpp",
@@ -26,9 +27,10 @@ $sources = @(
     "imgui/imgui_impl_opengl3.cpp"
 )
 
-$output = "Forensictaskmanager.exe"
+$output = "ForensicTaskManager.exe"
 $includes = "-Iimgui", "-I."
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-luuid"
+
+$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi"
 
 Write-Host "[INFO] Compiling source code and linking Win32 / OpenGL libraries..." -ForegroundColor Yellow
 
@@ -39,10 +41,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host " [SUCCESS] Build completed successfully!   " -ForegroundColor Green
     Write-Host " [INFO] Executable generated: .\$output    " -ForegroundColor Cyan
     Write-Host "-----------------------------------------" -ForegroundColor Green
-    
-    Write-Host "Launching Forensic task manager..." -ForegroundColor Cyan
-    Start-Sleep -Seconds 1
-    .\$output
+
 } else {
     Write-Host "-----------------------------------------" -ForegroundColor Red
     Write-Host " [ERROR] Compilation failed with errors. " -ForegroundColor Red
