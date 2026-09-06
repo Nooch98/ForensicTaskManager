@@ -11,21 +11,24 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 * **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, etc.) to extract process data, memory maps, threads, modules, and network connections.
 * **Data Caching Pattern:** To mitigate UI stuttering caused by heavy blocking Win32 calls (such as `CreateToolhelp32Snapshot`), data is fetched and updated via a timed caching loop (`refreshTimer`) rather than every single frame.
 
-## Core Features
-
 * **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
-* **Real-time Performance Graphs:** Custom historical ring-buffers tracking CPU, RAM, Disk, and Network activity.
+* **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
 * **Advanced Process Inspector:**
   * **Virtual Memory Map:** Enumerates memory regions, states, protections, and types (`VirtualQueryEx`).
   * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
   * **Network Connections:** Tracks active TCP endpoints per process.
-* **System Tools:** Windows services viewer, startup applications optimizer, environment variables inspector, and installed software manager with uninstaller execution.
+* **DLL Dependency Viewer:** Inspects native Portable Executable (PE) headers, imported APIs, and export symbols.
+* **Crash & Memory Dump Analyzer:** Forensic inspection tool for handling memory dumps and diagnosing critical application crashes.
+* **System Maintenance & Utilities:** 
+  * **Windows Services Manager:** Interactive control to query, start, and stop system services.
+  * **Startup & Installed Software:** Startup application optimizer, environment variables inspector, and installed software manager with uninstaller execution.
+  * **Quick System Maintenance:** Built-in shortcuts for temporary file cleanup, recycle bin emptying, DNS cache flushing, Winsock/IP resets, and automated SFC/DISM system integrity scans.
 
 ## Gallery
 
 <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/user-attachments/assets/1035db68-910b-49d0-b579-a6c65264afd4" alt="Process Inspector" /><br/>
+      <img width="1917" height="1044" src="https://github.com/user-attachments/assets/70202a60-979c-4caf-8e90-502a343055a2" alt="Process Inspector" /><br/>
       <sub><b>Advanced Process Inspector</b><br/><i>Virtual Memory, Modules, & TCP Endpoints</i></sub>
     </td>
     <td align="center" width="50%">
@@ -33,7 +36,18 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
       <sub><b>DLL Dependency Viewer</b><br/><i>Native PE Headers & Export Symbols</i></sub>
     </td>
   </tr>
+  <tr>
+    <td align="center" width="50%">
+      <img width="1919" height="1045" src="https://github.com/user-attachments/assets/956905ac-7367-47e7-b386-23bca8a7078e" alt="Live Tracker" /><br/>
+      <sub><b>Live System Tracker</b><br/><i>Real-time Performance & Activity Charts</i></sub>
+    </td>
+    <td align="center" width="50%">
+      <img width="1915" height="1044" src="https://github.com/user-attachments/assets/d3848ff9-476f-437c-8bc3-8202cd1cdae1" alt="Dump Analyzer" /><br/>
+      <sub><b>Dump Analyzer</b><br/><i>Memory Dumps & Forensic Inspection</i></sub>
+    </td>
+  </tr>
 </table>
+
 
 
 ## Known Areas for Improvement (Learning In Progress)
