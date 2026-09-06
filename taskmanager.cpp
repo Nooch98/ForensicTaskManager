@@ -1,4 +1,5 @@
 #define IDI_ICON1 101
+#include <initguid.h>
 #include <winsock2.h>
 #include <windows.h>
 #include <psapi.h>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <commdlg.h>
 #include <dbghelp.h>
+#include <comdef.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Ws2_32.lib")
@@ -132,9 +134,9 @@ struct ServiceInfoItemExt {
 };
 
 struct ScheduledTaskItem {
-    std::string name;
-    std::string path;
-    bool isEnabled;
+    std::wstring name;
+    std::wstring path;
+    bool enabled;
 };
 
 struct DllExportItem {
@@ -297,11 +299,84 @@ std::vector<ServiceInfoItemExt> GetWindowsServicesExt() {
     return services;
 }
 
+void EnumTasksInFolder(ITaskFolder* pFolder, std::vector<ScheduledTaskItem>& tasks) {
+    IRegisteredTaskCollection* pTaskCollection = NULL;
+    if (SUCCEEDED(pFolder->GetTasks(TASK_ENUM_HIDDEN, &pTaskCollection))) {
+        LONG numTasks = 0;
+        pTaskCollection->get_Count(&numTasks);
+
+        for (LONG i = 0; i < numTasks; i++) {
+            IRegisteredTask* pRegisteredTask = NULL;
+            if (SUCCEEDED(pTaskCollection->get_Item(_variant_t(i + 1), &pRegisteredTask))) {
+                BSTR bstrName = NULL;
+                BSTR bstrPath = NULL;
+                VARIANT_BOOL bEnabled = VARIANT_FALSE;
+
+                pRegisteredTask->get_Name(&bstrName);
+                pRegisteredTask->get_Path(&bstrPath);
+                pRegisteredTask->get_Enabled(&bEnabled);
+
+                ScheduledTaskItem item;
+                item.name = bstrName ? bstrName : L"";
+                item.path = bstrPath ? bstrPath : L"";
+                item.enabled = (bEnabled == VARIANT_TRUE);
+
+                tasks.push_back(item);
+
+                if (bstrName) SysFreeString(bstrName);
+                if (bstrPath) SysFreeString(bstrPath);
+                pRegisteredTask->Release();
+            }
+        }
+        pTaskCollection->Release();
+    }
+
+    ITaskFolderCollection* pFolderCollection = NULL;
+    if (SUCCEEDED(pFolder->GetFolders(0, &pFolderCollection))) {
+        LONG numFolders = 0;
+        pFolderCollection->get_Count(&numFolders);
+
+        for (LONG i = 0; i < numFolders; i++) {
+            ITaskFolder* pSubFolder = NULL;
+            if (SUCCEEDED(pFolderCollection->get_Item(_variant_t(i + 1), &pSubFolder))) {
+                EnumTasksInFolder(pSubFolder, tasks);
+                pSubFolder->Release();
+            }
+        }
+        pFolderCollection->Release();
+    }
+}
+
 std::vector<ScheduledTaskItem> GetScheduledTasks() {
     std::vector<ScheduledTaskItem> tasks;
-    tasks.push_back({"GoogleUpdateTaskMachineCore", "\\", true});
-    tasks.push_back({"OneDrive Reporting Task", "\\", true});
-    tasks.push_back({"Adobe Acrobat Update Task", "\\", false});
+
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    bool coInitialized = SUCCEEDED(hr);
+
+    ITaskService* pService = NULL;
+    hr = CoCreateInstance(CLSID_TaskScheduler,
+                          NULL,
+                          CLSCTX_INPROC_SERVER,
+                          IID_ITaskService,
+                          (void**)&pService);
+
+    if (SUCCEEDED(hr)) {
+        hr = pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t());
+        if (SUCCEEDED(hr)) {
+            ITaskFolder* pRootFolder = NULL;
+            hr = pService->GetFolder(_bstr_t(L"\\"), &pRootFolder);
+            if (SUCCEEDED(hr)) {
+                EnumTasksInFolder(pRootFolder, tasks);
+                pRootFolder->Release();
+            }
+        }
+        pService->Release();
+    }
+
+    if (coInitialized) {
+        CoUninitialize();
+    }
+
     return tasks;
 }
 
@@ -1401,22 +1476,25 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     std::transform(tFilter.begin(), tFilter.end(), tFilter.begin(), ::tolower);
 
                     for (auto& task : cachedTasks) {
-                        std::string tNameLower = task.name;
+                        std::string taskNameStr(task.name.begin(), task.name.end());
+                        std::string taskPathStr(task.path.begin(), task.path.end());
+
+                        std::string tNameLower = taskNameStr;
                         std::transform(tNameLower.begin(), tNameLower.end(), tNameLower.begin(), ::tolower);
                         if (!tFilter.empty() && tNameLower.find(tFilter) == std::string::npos) continue;
 
                         ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0); ImGui::Text("%s", task.name.c_str());
+                        ImGui::TableSetColumnIndex(0); ImGui::Text("%s", taskNameStr.c_str());
                         ImGui::TableSetColumnIndex(1); 
-                        ImGui::TextColored(task.isEnabled ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f), 
-                            task.isEnabled ? "Enabled" : "Disabled");
-                        ImGui::TableSetColumnIndex(2); ImGui::Text("%s", task.path.c_str());
+                        ImGui::TextColored(task.enabled ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f) : ImVec4(0.9f, 0.3f, 0.3f, 1.0f), 
+                            task.enabled ? "Enabled" : "Disabled");
+                        ImGui::TableSetColumnIndex(2); ImGui::Text("%s", taskPathStr.c_str());
                         
                         ImGui::TableSetColumnIndex(3);
                         char togBtn[64];
-                        snprintf(togBtn, sizeof(togBtn), "Change##%s", task.name.c_str());
+                        snprintf(togBtn, sizeof(togBtn), "Change##%s", taskNameStr.c_str());
                         if (ImGui::Button(togBtn)) {
-                            task.isEnabled = !task.isEnabled; 
+                            task.enabled = !task.enabled; 
                         }
                     }
                     ImGui::EndTable();
@@ -1424,16 +1502,38 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
-            // TAB: DLL DEPENDENCY VIEWER (BUSCADOR DE DEPENDENCIAS DE DLLs)
+            // TAB: DLL DEPENDENCY VIEWER
             if (ImGui::BeginTabItem("DLL Dependency Viewer")) {
                 ImGui::Text("Inspect Exported Functions & Symbols of any DLL");
                 ImGui::Separator();
-                ImGui::InputText("DLL File Path", dllSearchBuffer, sizeof(dllSearchBuffer));
+
+                ImGui::SetNextItemWidth(-180.0f);
+                ImGui::InputText("##DllFilePath", dllSearchBuffer, sizeof(dllSearchBuffer));
+                
+                ImGui::SameLine();
+                if (ImGui::Button("Browse...")) {
+                    OPENFILENAMEW ofn;
+                    wchar_t szFile[260] = { 0 };
+                    ZeroMemory(&ofn, sizeof(ofn));
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFile = szFile;
+                    ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
+                    ofn.lpstrFilter = L"DLL Files (*.dll)\0*.dll\0Executable Files (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
+                    ofn.nFilterIndex = 1;
+                    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+                    if (GetOpenFileNameW(&ofn) == TRUE) {
+                        WideCharToMultiByte(CP_UTF8, 0, ofn.lpstrFile, -1, dllSearchBuffer, sizeof(dllSearchBuffer), NULL, NULL);
+                    }
+                }
+
                 ImGui::SameLine();
                 if (ImGui::Button("Scan Exports")) {
                     selectedDllPath = dllSearchBuffer;
                     cachedDllExports = GetDllExports(selectedDllPath);
                 }
+                
                 ImGui::Separator();
 
                 if (ImGui::BeginTable("DllExportTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, (float)winHeight - 210.0f))) {
