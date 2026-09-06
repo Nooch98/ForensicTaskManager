@@ -22,12 +22,15 @@
 #include <comdef.h>
 #include <functional>
 #include <unordered_set>
+#include <softpub.h>
+#include <wintrust.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "comsupp.lib")
+#pragma comment(lib, "wintrust.lib")
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -88,9 +91,10 @@ struct ServiceInfoItem {
 
 struct StartupAppItem {
     std::string name;
-    std::string location;
     std::string path;
+    std::string location;
     bool isEnabled;
+    std::wstring registryValueName;
 };
 
 struct InstalledAppItem {
@@ -99,6 +103,8 @@ struct InstalledAppItem {
     std::string version;
     std::string uninstallString;
     std::string installLocation;
+    std::string sizeStr;
+    DWORD rawSizeKB = 0;
 };
 
 struct EnvVarItem {
@@ -170,6 +176,24 @@ struct DumpSummaryInfo {
     std::vector<ThreadBasicInfo> threads;
 };
 
+struct DriverItem {
+    std::string name;
+    std::string path;
+    void* loadAddress;
+    bool isSigned = false;
+};
+
+struct NetworkConnectionItem {
+    std::string protocol;
+    std::string localIp;
+    int localPort;
+    std::string remoteIp;
+    int remotePort;
+    std::string state;
+    DWORD pid;
+    std::string processName;
+};
+
 static std::unordered_map<DWORD, ProcessTimeData> g_ProcessHistory;
 static PerfHistory g_PerfHistory;
 
@@ -215,6 +239,12 @@ std::vector<MemoryRegion> GetProcessMemoryMap(DWORD pid, std::string& outError);
 std::vector<ModuleInfoItem> GetProcessModules(DWORD pid, std::string& outError);
 std::vector<ThreadInfoItem> GetProcessThreads(DWORD pid, std::string& outError);
 std::vector<ConnectionInfoItem> GetProcessConnections(DWORD pid, std::string& outError);
+std::vector<DriverItem> cachedDrivers;
+char driverSearchBuffer[128] = "";
+std::vector<NetworkConnectionItem> cachedNetConnections;
+char netSearchBuffer[128] = "";
+static bool showNetDetailsModal = false;
+static NetworkConnectionItem selectedNetConn;
 bool EnableDebugPrivilege();
 bool GetSaveDumpFilePath(char* outPath, DWORD maxPath, HWND hwndOwner);
 bool DumpCriticalProcessMemory(DWORD processId, const char* outputPath);
@@ -286,6 +316,130 @@ bool GetSaveDumpFilePath(char* outPath, DWORD maxPath, HWND hwndOwner) {
     ofn.lpstrDefExt = "dmp";
     
     return GetSaveFileNameA(&ofn) == TRUE;
+}
+
+bool VerifyFileSignature(const std::wstring& filePath) {
+    if (filePath.empty()) return false;
+
+    std::wstring ntPath = filePath;
+    if (ntPath.rfind(L"\\SystemRoot\\", 0) == 0) {
+        wchar_t windir[MAX_PATH];
+        GetWindowsDirectoryW(windir, MAX_PATH);
+        ntPath.replace(0, 11, windir);
+    }
+
+    WINTRUST_FILE_INFO fileInfo = { 0 };
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = ntPath.c_str();
+    fileInfo.hFile = NULL;
+    fileInfo.pgKnownSubject = NULL;
+
+    GUID policyGuid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA trustData = { 0 };
+    trustData.cbStruct = sizeof(WINTRUST_DATA);
+    trustData.pPolicyCallbackData = NULL;
+    trustData.pSIPClientData = NULL;
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    trustData.hWVTStateData = NULL;
+    trustData.pwszURLReference = NULL;
+    trustData.dwProvFlags = WTD_SAFER_FLAG;
+    trustData.dwUIContext = WTD_UICONTEXT_EXECUTE;
+    trustData.pFile = &fileInfo;
+
+    LONG status = WinVerifyTrust(NULL, &policyGuid, &trustData);
+
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &policyGuid, &trustData);
+
+    return (status == ERROR_SUCCESS);
+}
+
+std::vector<NetworkConnectionItem> GetActiveConnections() {
+    std::vector<NetworkConnectionItem> connections;
+    PMIB_TCPTABLE2 tcpTable = NULL;
+    DWORD dwSize = 0;
+    
+    if (GetTcpTable2(NULL, &dwSize, TRUE) == ERROR_INSUFFICIENT_BUFFER) {
+        tcpTable = (PMIB_TCPTABLE2)malloc(dwSize);
+        if (tcpTable && GetTcpTable2(tcpTable, &dwSize, TRUE) == NO_ERROR) {
+            for (DWORD i = 0; i < tcpTable->dwNumEntries; i++) {
+                MIB_TCPROW2 row = tcpTable->table[i];
+                NetworkConnectionItem item;
+                item.protocol = "TCP";
+                item.pid = row.dwOwningPid;
+
+                in_addr localAddr;
+                localAddr.s_addr = row.dwLocalAddr;
+                char localIpStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &localAddr, localIpStr, sizeof(localIpStr));
+                item.localIp = localIpStr;
+                item.localPort = ntohs((u_short)row.dwLocalPort);
+
+                in_addr remoteAddr;
+                remoteAddr.s_addr = row.dwRemoteAddr;
+                char remoteIpStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &remoteAddr, remoteIpStr, sizeof(remoteIpStr));
+                item.remoteIp = remoteIpStr;
+                item.remotePort = ntohs((u_short)row.dwRemotePort);
+
+                switch (row.dwState) {
+                    case MIB_TCP_STATE_ESTAB: item.state = "ESTABLISHED"; break;
+                    case MIB_TCP_STATE_LISTEN: item.state = "LISTEN"; break;
+                    case MIB_TCP_STATE_TIME_WAIT: item.state = "TIME_WAIT"; break;
+                    case MIB_TCP_STATE_SYN_SENT: item.state = "SYN_SENT"; break;
+                    default: item.state = "OTHER"; break;
+                }
+
+                item.processName = "PID: " + std::to_string(item.pid);
+
+                connections.push_back(item);
+            }
+        }
+        if (tcpTable) free(tcpTable);
+    }
+    
+    return connections;
+}
+
+std::vector<DriverItem> GetLoadedDrivers() {
+    std::vector<DriverItem> drivers;
+    LPVOID driverAddresses[1024];
+    DWORD cbNeeded;
+
+    if (EnumDeviceDrivers(driverAddresses, sizeof(driverAddresses), &cbNeeded)) {
+        int driverCount = cbNeeded / sizeof(LPVOID);
+
+        for (int i = 0; i < driverCount; ++i) {
+            DriverItem item;
+            item.loadAddress = driverAddresses[i];
+
+            wchar_t szFilename[MAX_PATH];
+            if (GetDeviceDriverBaseNameW(driverAddresses[i], szFilename, sizeof(szFilename) / sizeof(wchar_t))) {
+                int sz = WideCharToMultiByte(CP_UTF8, 0, szFilename, -1, NULL, 0, NULL, NULL);
+                std::string s(sz, 0);
+                WideCharToMultiByte(CP_UTF8, 0, szFilename, -1, &s[0], sz, NULL, NULL);
+                s.resize(sz - 1);
+                item.name = s;
+            }
+
+            wchar_t szFullPath[MAX_PATH];
+            if (GetDeviceDriverFileNameW(driverAddresses[i], szFullPath, sizeof(szFullPath) / sizeof(wchar_t))) {
+                int sz = WideCharToMultiByte(CP_UTF8, 0, szFullPath, -1, NULL, 0, NULL, NULL);
+                std::string s(sz, 0);
+                WideCharToMultiByte(CP_UTF8, 0, szFullPath, -1, &s[0], sz, NULL, NULL);
+                s.resize(sz - 1);
+                item.path = s;
+
+                item.isSigned = VerifyFileSignature(szFullPath);
+            }
+
+            drivers.push_back(item);
+        }
+    }
+    return drivers;
 }
 
 std::string LoadThemeConfig() {
@@ -947,13 +1101,13 @@ std::vector<StartupAppItem> GetStartupAppsEnhanced() {
         HKEY root;
         const wchar_t* subKey;
         std::string locName;
-        bool checkDisabledFolder;
+        const wchar_t* approvedSubKey;
     };
 
     RegPath paths[] = {
-        { HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKCU\\Run", true },
-        { HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Run", false },
-        { HKEY_LOCAL_MACHINE, L"Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Run (32-bit)", false }
+        { HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKCU\\Run", L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run" },
+        { HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Run", NULL },
+        { HKEY_LOCAL_MACHINE, L"Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run", "HKLM\\Run (32-bit)", NULL }
     };
 
     for (const auto& rp : paths) {
@@ -964,8 +1118,8 @@ std::vector<StartupAppItem> GetStartupAppsEnhanced() {
             DWORD nameSize, dataSize, type;
 
             HKEY hApprovedKey = NULL;
-            if (rp.checkDisabledFolder) {
-                RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run", 0, KEY_READ, &hApprovedKey);
+            if (rp.approvedSubKey) {
+                RegOpenKeyExW(HKEY_CURRENT_USER, rp.approvedSubKey, 0, KEY_READ, &hApprovedKey);
             }
 
             while (true) {
@@ -975,6 +1129,7 @@ std::vector<StartupAppItem> GetStartupAppsEnhanced() {
 
                 if (type == REG_SZ || type == REG_EXPAND_SZ) {
                     StartupAppItem app;
+                    
                     int size_needed = WideCharToMultiByte(CP_UTF8, 0, valueName, -1, NULL, 0, NULL, NULL);
                     std::string strName(size_needed, 0);
                     WideCharToMultiByte(CP_UTF8, 0, valueName, -1, &strName[0], size_needed, NULL, NULL);
@@ -989,15 +1144,14 @@ std::vector<StartupAppItem> GetStartupAppsEnhanced() {
 
                     app.location = rp.locName;
                     app.isEnabled = true;
+                    app.registryValueName = valueName;
 
                     if (hApprovedKey) {
-                        BYTE одобData[128];
-                        DWORD одобSize = sizeof(одобData);
-                        if (RegQueryValueExW(hApprovedKey, valueName, NULL, NULL, одобData, &одобSize) == ERROR_SUCCESS) {
-                            if (одобData[0] & 1) { 
-                                if (одобData[0] == 0x03 || (одобData[0] & 1)) {
-                                    app.isEnabled = false;
-                                }
+                        BYTE approvedData[128];
+                        DWORD approvedSize = sizeof(approvedData);
+                        if (RegQueryValueExW(hApprovedKey, valueName, NULL, NULL, approvedData, &approvedSize) == ERROR_SUCCESS) {
+                            if (approvedData[0] == 0x03 || (approvedData[0] & 1)) {
+                                app.isEnabled = false;
                             }
                         }
                     }
@@ -1009,7 +1163,93 @@ std::vector<StartupAppItem> GetStartupAppsEnhanced() {
             RegCloseKey(hKey);
         }
     }
+
+    wchar_t startupPath[MAX_PATH];
+    HKEY hApprovedStartupKey = NULL;
+    RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder", 0, KEY_READ, &hApprovedStartupKey);
+
+    int csidlFolders[] = { CSIDL_STARTUP, CSIDL_COMMON_STARTUP };
+    std::string locNames[] = { "Startup Folder (User)", "Startup Folder (Common)" };
+
+    for (int i = 0; i < 2; ++i) {
+        if (SUCCEEDED(SHGetFolderPathW(NULL, csidlFolders[i], NULL, 0, startupPath))) {
+            std::wstring searchPath = std::wstring(startupPath) + L"\\*.*";
+            WIN32_FIND_DATAW findData;
+            HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        StartupAppItem app;
+                        std::wstring fileName = findData.cFileName;
+                        
+                        int size_needed = WideCharToMultiByte(CP_UTF8, 0, fileName.c_str(), -1, NULL, 0, NULL, NULL);
+                        std::string strName(size_needed, 0);
+                        WideCharToMultiByte(CP_UTF8, 0, fileName.c_str(), -1, &strName[0], size_needed, NULL, NULL);
+                        strName.resize(size_needed - 1);
+                        app.name = strName;
+
+                        std::wstring fullPath = std::wstring(startupPath) + L"\\" + fileName;
+                        int size_needed_path = WideCharToMultiByte(CP_UTF8, 0, fullPath.c_str(), -1, NULL, 0, NULL, NULL);
+                        std::string strPath(size_needed_path, 0);
+                        WideCharToMultiByte(CP_UTF8, 0, fullPath.c_str(), -1, &strPath[0], size_needed_path, NULL, NULL);
+                        strPath.resize(size_needed_path - 1);
+                        app.path = strPath;
+
+                        app.location = locNames[i];
+                        app.isEnabled = true;
+                        app.registryValueName = fileName;
+
+                        if (hApprovedStartupKey) {
+                            BYTE approvedData[128];
+                            DWORD approvedSize = sizeof(approvedData);
+                            if (RegQueryValueExW(hApprovedStartupKey, fileName.c_str(), NULL, NULL, approvedData, &approvedSize) == ERROR_SUCCESS) {
+                                if (approvedData[0] == 0x03 || (approvedData[0] & 1)) {
+                                    app.isEnabled = false;
+                                }
+                            }
+                        }
+
+                        apps.push_back(app);
+                    }
+                } while (FindNextFileW(hFind, &findData));
+                FindClose(hFind);
+            }
+        }
+    }
+    if (hApprovedStartupKey) RegCloseKey(hApprovedStartupKey);
+
     return apps;
+}
+
+bool SetStartupAppEnabled(const StartupAppItem& app, bool enable) {
+    HKEY hKey = NULL;
+    std::wstring subKey;
+
+    if (app.location == "HKCU\\Run") {
+        subKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+    } else if (app.location.find("Startup Folder") != std::string::npos) {
+        subKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder";
+    } else {
+        subKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+    }
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        BYTE data[12] = { 0 };
+        DWORD size = sizeof(data);
+        DWORD type = REG_BINARY;
+        RegQueryValueExW(hKey, app.registryValueName.c_str(), NULL, &type, data, &size);
+        if (enable) {
+            data[0] = 0x02;
+        } else {
+            data[0] = 0x03;
+        }
+
+        LONG res = RegSetValueExW(hKey, app.registryValueName.c_str(), 0, REG_BINARY, data, sizeof(data));
+        RegCloseKey(hKey);
+        return res == ERROR_SUCCESS;
+    }
+    return false;
 }
 
 std::vector<InstalledAppItem> GetInstalledApplications() {
@@ -1072,6 +1312,25 @@ std::vector<InstalledAppItem> GetInstalledApplications() {
                                 size = sizeof(installLoc);
                                 if (RegQueryValueExW(hAppKey, L"InstallLocation", NULL, NULL, (LPBYTE)installLoc, &size) == ERROR_SUCCESS)
                                     item.installLocation = wideToString(installLoc);
+
+                                DWORD estSize = 0;
+                                DWORD estSizeLen = sizeof(estSize);
+                                if (RegQueryValueExW(hAppKey, L"EstimatedSize", NULL, NULL, (LPBYTE)&estSize, &estSizeLen) == ERROR_SUCCESS) {
+                                    item.rawSizeKB = estSize;
+                                    if (estSize > 1024 * 1024) {
+                                        char szBuf[64];
+                                        snprintf(szBuf, sizeof(szBuf), "%.2f GB", (float)estSize / (1024.0f * 1024.0f));
+                                        item.sizeStr = szBuf;
+                                    } else if (estSize > 0) {
+                                        char szBuf[64];
+                                        snprintf(szBuf, sizeof(szBuf), "%.2f MB", (float)estSize / 1024.0f);
+                                        item.sizeStr = szBuf;
+                                    } else {
+                                        item.sizeStr = "0 KB";
+                                    }
+                                } else {
+                                    item.sizeStr = "Unknown";
+                                }
 
                                 list.push_back(item);
                             }
@@ -1516,7 +1775,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::EndMenuBar();
         }
 
-        if (ImGui::BeginTabBar("MainTabs")) {
+        if (ImGui::BeginTabBar("MainTabs", ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_TabListPopupButton)) {
             
             // TAB: PERFORMANCE // CHARTS
             if (ImGui::BeginTabItem("Performance // Charts")) {
@@ -1637,6 +1896,141 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
+            // TAB KERNEL DRIVERS WITH SING VERIFICATION
+            if (ImGui::BeginTabItem("Kernel Drivers")) {
+                if (cachedDrivers.empty()) {
+                    cachedDrivers = GetLoadedDrivers();
+                }
+
+                ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ LOADED KERNEL DRIVERS INVENTORY ]");
+                ImGui::SameLine(winWidth - 200);
+                ImGui::Text("TOTAL: %zu", cachedDrivers.size());
+                ImGui::Separator();
+
+                ImGui::Text("Filter:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(250);
+                ImGui::InputText("##driverSearch", driverSearchBuffer, sizeof(driverSearchBuffer));
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh Drivers")) {
+                    cachedDrivers = GetLoadedDrivers();
+                }
+                
+                ImGui::Spacing();
+                float tableHeight = (float)winHeight - 190.0f;
+
+                if (ImGui::BeginTable("DriversTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, tableHeight))) {
+                    ImGui::TableSetupColumn("Driver Name", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                    ImGui::TableSetupColumn("Signed", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                    ImGui::TableSetupColumn("Load Address", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                    ImGui::TableSetupColumn("File Path", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                    ImGui::TableHeadersRow();
+
+                    std::string filterStr = driverSearchBuffer;
+                    std::transform(filterStr.begin(), filterStr.end(), filterStr.begin(), ::tolower);
+
+                    for (size_t i = 0; i < cachedDrivers.size(); ++i) {
+                        const auto& drv = cachedDrivers[i];
+
+                        std::string nameLower = drv.name;
+                        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+                        if (!filterStr.empty() && nameLower.find(filterStr) == std::string::npos) continue;
+                        ImGui::TableNextRow();
+                        ImGui::PushID((int)i);
+                        ImGui::TableSetColumnIndex(0); 
+                        ImGui::Text("%s", drv.name.c_str());
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%s", drv.isSigned ? "Yes" : "No");
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("0x%p", drv.loadAddress);
+                        ImGui::TableSetColumnIndex(3); 
+                        ImGui::Text("%s", drv.path.c_str());
+
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::EndTabItem();
+            }
+            
+            // TAB NETWORK CONNECTIONS
+            if (ImGui::BeginTabItem("Network Connections")) {
+                if (cachedNetConnections.empty()) {
+                    cachedNetConnections = GetActiveConnections();
+                }
+
+                ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ ACTIVE NETWORK CONNECTIONS ]");
+                ImGui::SameLine(winWidth - 200);
+                ImGui::Text("TOTAL: %zu", cachedNetConnections.size());
+                ImGui::Separator();
+
+                ImGui::Text("Filter:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(250);
+                ImGui::InputText("##netSearch", netSearchBuffer, sizeof(netSearchBuffer));
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh Net")) {
+                    cachedNetConnections = GetActiveConnections();
+                }
+                
+                ImGui::Spacing();
+                float tableHeight = (float)winHeight - 190.0f;
+
+                if (ImGui::BeginTable("NetTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, tableHeight))) {
+                    ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                    ImGui::TableSetupColumn("Local Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                    ImGui::TableSetupColumn("Remote Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                    ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("Process / PID", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                    ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                    ImGui::TableHeadersRow();
+
+                    std::string filterStr = netSearchBuffer;
+                    std::transform(filterStr.begin(), filterStr.end(), filterStr.begin(), ::tolower);
+
+                    for (size_t i = 0; i < cachedNetConnections.size(); ++i) {
+                        const auto& conn = cachedNetConnections[i];
+
+                        std::string remoteLower = conn.remoteIp;
+                        std::transform(remoteLower.begin(), remoteLower.end(), remoteLower.begin(), ::tolower);
+                        if (!filterStr.empty() && remoteLower.find(filterStr) == std::string::npos && conn.state.find(filterStr) == std::string::npos) {
+                            continue;
+                        }
+
+                        ImGui::TableNextRow();
+                        ImGui::PushID((int)i);
+                        
+                        ImGui::TableSetColumnIndex(0); 
+                        ImGui::Text("%s", conn.protocol.c_str());
+                        
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%s:%d", conn.localIp.c_str(), conn.localPort);
+                        
+                        ImGui::TableSetColumnIndex(2); 
+                        ImGui::Text("%s:%d", conn.remoteIp.c_str(), conn.remotePort);
+
+                        ImGui::TableSetColumnIndex(3);
+                        if (conn.state == "ESTABLISHED") {
+                            ImGui::TextColored(ImVec4(0.0f, 0.8f, 0.0f, 1.0f), "%s", conn.state.c_str());
+                        } else {
+                            ImGui::Text("%s", conn.state.c_str());
+                        }
+
+                        ImGui::TableSetColumnIndex(4); 
+                        ImGui::Text("%s", conn.processName.c_str());
+
+                        ImGui::TableSetColumnIndex(5);
+                        if (ImGui::Button("Inspect")) {
+                            selectedNetConn = conn;
+                            showNetDetailsModal = true;
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+                ImGui::EndTabItem();
+            }
+
             // TAB: INSTALLED APPS
             if (ImGui::BeginTabItem("Installed Apps")) {
                 ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ INSTALLED SOFTWARE INVENTORY ]");
@@ -1656,8 +2050,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::Spacing();
                 float tableHeight = (float)winHeight - 190.0f;
 
-                if (ImGui::BeginTable("InstalledAppsTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, tableHeight))) {
+                if (ImGui::BeginTable("InstalledAppsTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, tableHeight))) {
                     ImGui::TableSetupColumn("Application Name", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                    ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                     ImGui::TableSetupColumn("Version", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                     ImGui::TableSetupColumn("Actions / Details", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                     ImGui::TableHeadersRow();
@@ -1665,32 +2060,34 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     std::string filterStr = installedSearchBuffer;
                     std::transform(filterStr.begin(), filterStr.end(), filterStr.begin(), ::tolower);
 
-                    for (const auto& app : cachedInstalledApps) {
+                    for (size_t i = 0; i < cachedInstalledApps.size(); ++i) {
+                        const auto& app = cachedInstalledApps[i];
+
                         std::string nameLower = app.name;
                         std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
                         if (!filterStr.empty() && nameLower.find(filterStr) == std::string::npos) continue;
-
-                        ImGui::TableNextRow();
+                        ImGui::TableNextRow();                        
+                        ImGui::PushID((int)i);
                         ImGui::TableSetColumnIndex(0); 
                         ImGui::Text("%s", app.name.c_str());
-                        
-                        ImGui::TableSetColumnIndex(1); 
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%s", app.sizeStr.c_str());
+                        ImGui::TableSetColumnIndex(2); 
                         ImGui::Text("%s", app.version.c_str());
-
-                        ImGui::TableSetColumnIndex(2);
-                        char btnId[64];
-                        snprintf(btnId, sizeof(btnId), "Details##%s", app.name.c_str());
-                        if (ImGui::Button(btnId)) {
+                        ImGui::TableSetColumnIndex(3);
+                        if (ImGui::Button("Details")) {
                             selectedInstalledApp = app;
                             showAppDetailsModal = true;
                         }
+
+                        ImGui::PopID();
                     }
                     ImGui::EndTable();
                 }
                 ImGui::EndTabItem();
             }
 
-            // TAB: WINDOWS SERVICES (CONTROLADORES INTERACTIVOS)
+            // TAB: WINDOWS SERVICES
             if (ImGui::BeginTabItem("Windows Services")) {
                 ImGui::Text("Registered System Services & Interactive Control");
                 ImGui::Separator();
@@ -1741,7 +2138,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
-            // TAB: SCHEDULED TASKS (GESTOR DE TAREAS PROGRAMADAS)
+            // TAB: SCHEDULED TASKS
             if (ImGui::BeginTabItem("Scheduled Tasks")) {
                 ImGui::Text("Windows Task Scheduler Explorer");
                 ImGui::Separator();
@@ -1836,18 +2233,31 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
             // TAB: STARTUP APPLICATIONS
             if (ImGui::BeginTabItem("Startup Applications")) {
-                ImGui::Text("Auto-start Registry Programs & Status");
+                ImGui::Text("Auto-start Registry Programs, Folders & Status");
                 ImGui::Separator();
-                if (ImGui::BeginTable("StartupTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, (float)winHeight - 170.0f))) {
+                
+                if (ImGui::Button("Refresh List")) {
+                    cachedStartup = GetStartupAppsEnhanced();
+                }
+                
+                ImGui::SameLine();
+                ImGui::TextDisabled("(Changes apply instantly, matching Windows Task Manager behavior)");
+                ImGui::Spacing();
+
+                if (ImGui::BeginTable("StartupTable", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, (float)winHeight - 170.0f))) {
                     ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 180.0f);
-                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-                    ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                    ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                     ImGui::TableSetupColumn("Executable Path", ImGuiTableColumnFlags_WidthStretch, 1.0f);
                     ImGui::TableHeadersRow();
 
-                    for (const auto& app : cachedStartup) {
+                    for (size_t i = 0; i < cachedStartup.size(); ++i) {
+                        auto& app = cachedStartup[i];
                         ImGui::TableNextRow();
-                        ImGui::TableSetColumnIndex(0); ImGui::Text("%s", app.name.c_str());
+                        
+                        ImGui::TableSetColumnIndex(0); 
+                        ImGui::Text("%s", app.name.c_str());
                         
                         ImGui::TableSetColumnIndex(1); 
                         if (app.isEnabled) {
@@ -1856,8 +2266,28 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "Disabled");
                         }
 
-                        ImGui::TableSetColumnIndex(2); ImGui::Text("%s", app.location.c_str());
-                        ImGui::TableSetColumnIndex(3); ImGui::Text("%s", app.path.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::PushID((int)i);
+                        if (app.isEnabled) {
+                            if (ImGui::Button("Disable", ImVec2(90, 0))) {
+                                if (SetStartupAppEnabled(app, false)) {
+                                    app.isEnabled = false;
+                                }
+                            }
+                        } else {
+                            if (ImGui::Button("Enable", ImVec2(90, 0))) {
+                                if (SetStartupAppEnabled(app, true)) {
+                                    app.isEnabled = true;
+                                }
+                            }
+                        }
+                        ImGui::PopID();
+
+                        ImGui::TableSetColumnIndex(3); 
+                        ImGui::Text("%s", app.location.c_str());
+                        
+                        ImGui::TableSetColumnIndex(4); 
+                        ImGui::Text("%s", app.path.c_str());
                     }
                     ImGui::EndTable();
                 }
@@ -2264,6 +2694,42 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
         if (showAppDetailsModal) {
             ImGui::OpenPopup("Installed App Details");
+        }
+        if (showNetDetailsModal) {
+            ImGui::OpenPopup("Network Connection Details");
+        }
+        if (ImGui::BeginPopupModal("Network Connection Details", &showNetDetailsModal, ImGuiWindowFlags_NoResize)) {
+            ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ SOCKET & PROCESS FORENSICS ]");
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            ImGui::Text("Protocol:      %s", selectedNetConn.protocol.c_str());
+            ImGui::Text("Local Endpoint:  %s:%d", selectedNetConn.localIp.c_str(), selectedNetConn.localPort);
+            ImGui::Text("Remote Endpoint: %s:%d", selectedNetConn.remoteIp.c_str(), selectedNetConn.remotePort);
+            ImGui::Text("State:           %s", selectedNetConn.state.c_str());
+            ImGui::Text("Owner PID:       %lu", selectedNetConn.pid);
+            ImGui::Text("Process Name:    %s", selectedNetConn.processName.c_str());
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (ImGui::Button("Terminate Owner Process", ImVec2(180, 0))) {
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, selectedNetConn.pid);
+                if (hProc) {
+                    TerminateProcess(hProc, 1);
+                    CloseHandle(hProc);
+                    cachedNetConnections = GetActiveConnections();
+                }
+                showNetDetailsModal = false;
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button("Close", ImVec2(120, 0))) {
+                showNetDetailsModal = false;
+            }
+
+            ImGui::EndPopup();
         }
         if (ImGui::BeginPopupModal("Installed App Details", &showAppDetailsModal, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::Text("Name: %s", selectedInstalledApp.name.c_str());
