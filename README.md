@@ -1,4 +1,4 @@
-# Forensic Task Manager (NexusGlassManager)
+# Forensic Task Manager
 
 > **⚠️ Learning Project Disclaimer:** This project is built as a hands-on exercise to deepen my practical understanding of C++, the Win32 API, graphics rendering, and UI design patterns. Because I am actively learning, the codebase may contain bugs, inefficient algorithms, suboptimal patterns, or memory management flaws. Constructive feedback, code reviews, and issue reports are more than welcome!
 
@@ -11,14 +11,20 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 * **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, etc.) to extract process data, memory maps, threads, modules, and network connections.
 * **Data Caching Pattern:** To mitigate UI stuttering caused by heavy blocking Win32 calls (such as `CreateToolhelp32Snapshot`), data is fetched and updated via a timed caching loop (`refreshTimer`) rather than every single frame.
 
+## Core Features
+
 * **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
 * **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
-* **Advanced Process Inspector:**
+* **Advanced Process Inspector & Forensics:**
   * **Virtual Memory Map:** Enumerates memory regions, states, protections, and types (`VirtualQueryEx`).
   * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
-  * **Network Connections:** Tracks active TCP endpoints per process.
+  * **Process Control & Incident Response:** Supports termination, command-line arguments inspection, and **Process Suspension (`NtSuspendProcess`)** to freeze malicious activities or ransomware in real-time.
+  * **Authenticode Code Signing Verification:** Local validation of binary digital signatures using Win32 crypto APIs to flag unsigned or untrusted executables/drivers.
+  * **Process Memory Dumps:** Generates native application crash and mini-dumps (`MiniDumpWriteDump`) for offline analysis.
+* **Network & Socket Forensics:**
+  * Active TCP/UDP endpoint monitoring mapped directly to owner PIDs and process names.
+  * **Local Port & Heuristic Intelligence:** Built-in checks flagging anomalous or commonly abused ports (e.g., potential C2 or backdoor indicators) completely offline without third-party API dependencies.
 * **DLL Dependency Viewer:** Inspects native Portable Executable (PE) headers, imported APIs, and export symbols.
-* **Crash & Memory Dump Analyzer:** Forensic inspection tool for handling memory dumps and diagnosing critical application crashes.
 * **System Maintenance & Utilities:** 
   * **Windows Services Manager:** Interactive control to query, start, and stop system services.
   * **Startup & Installed Software:** Startup application optimizer, environment variables inspector, and installed software manager with uninstaller execution.
@@ -26,7 +32,8 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 
 ## Gallery
 
-<tr>
+<table>
+  <tr>
     <td align="center" width="50%">
       <img width="1917" height="1044" src="https://github.com/user-attachments/assets/70202a60-979c-4caf-8e90-502a343055a2" alt="Process Inspector" /><br/>
       <sub><b>Advanced Process Inspector</b><br/><i>Virtual Memory, Modules, & TCP Endpoints</i></sub>
@@ -47,8 +54,6 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
     </td>
   </tr>
 </table>
-
-
 
 ## Known Areas for Improvement (Learning In Progress)
 
