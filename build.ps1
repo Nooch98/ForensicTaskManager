@@ -7,7 +7,6 @@ Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host " Building Forensic Task Manager (Win32) " -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
 
-# Check if g++ is available in the system PATH
 if (!(Get-Command g++ -ErrorAction SilentlyContinue)) {
     Write-Host "[ERROR] 'g++' compiler not found in PATH. Please install MinGW-w64." -ForegroundColor Red
     exit 1
@@ -30,7 +29,7 @@ $sources = @(
 $output = "ForensicTaskManager.exe"
 $includes = "-Iimgui", "-I."
 
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi"
+$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust"
 
 Write-Host "[INFO] Compiling source code and linking Win32 / OpenGL libraries..." -ForegroundColor Yellow
 
