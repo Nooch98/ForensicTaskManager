@@ -34,14 +34,14 @@ $libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", 
 
 Write-Host "[INFO] Compiling source code and linking Win32 / OpenGL libraries..." -ForegroundColor Yellow
 
-& g++ @sources -o $output @includes @libs -static-libgcc -static-libstdc++
+
+& g++ @sources -o $output @includes @libs -mwindows -static-libgcc -static-libstdc++
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "-----------------------------------------" -ForegroundColor Green
     Write-Host " [SUCCESS] Build completed successfully!   " -ForegroundColor Green
     Write-Host " [INFO] Executable generated: .\$output    " -ForegroundColor Cyan
     Write-Host "-----------------------------------------" -ForegroundColor Green
-
 } else {
     Write-Host "-----------------------------------------" -ForegroundColor Red
     Write-Host " [ERROR] Compilation failed with errors. " -ForegroundColor Red
