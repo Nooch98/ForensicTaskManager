@@ -39,7 +39,8 @@ To avoid manual configuration or heavy IDE setups, you can use the provided auto
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/Nooch98/ForensicTaskManager.git](https://github.com/Nooch98/ForensicTaskManager.git)
+   git clone https://github.com/Nooch98/ForensicTaskManager.git
+   ```
 
 2. Open PowerShell and navigate to the project directory:
     ```bash
