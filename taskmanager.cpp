@@ -194,6 +194,14 @@ struct NetworkConnectionItem {
     std::string processName;
 };
 
+struct LiveMemoryRegion {
+    std::string baseAddress;
+    std::string regionSize;
+    std::string state;
+    std::string protection;
+    std::string type;
+};
+
 static std::unordered_map<DWORD, ProcessTimeData> g_ProcessHistory;
 static PerfHistory g_PerfHistory;
 
@@ -231,6 +239,9 @@ static std::vector<ModuleInfoItem> liveModules;
 static std::vector<ConnectionInfoItem> liveConnections;
 static std::string liveThreadsError, liveModulesError, liveConnectionsError;
 static ULONGLONG lastBehaviorPoll = 0;
+std::vector<LiveMemoryRegion> liveMemoryMap;
+std::string liveMemoryError;
+ULONGLONG lastMemoryMapPoll = 0;
 
 std::vector<ServiceInfoItemExt> GetWindowsServicesExt();
 std::vector<ScheduledTaskItem> GetScheduledTasks();
@@ -440,6 +451,58 @@ std::vector<DriverItem> GetLoadedDrivers() {
         }
     }
     return drivers;
+}
+
+std::vector<LiveMemoryRegion> GetProcessMemoryMap(HANDLE hProcess, std::string& errorStr) {
+    std::vector<LiveMemoryRegion> regions;
+    if (!hProcess) {
+        errorStr = "Invalid process handle";
+        return regions;
+    }
+
+    char* address = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    char buffer[64];
+
+    while (VirtualQueryEx(hProcess, address, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        LiveMemoryRegion reg;
+        sprintf_s(buffer, sizeof(buffer), "0x%p", mbi.BaseAddress);
+        reg.baseAddress = buffer;
+        sprintf_s(buffer, sizeof(buffer), "%lu KB", mbi.RegionSize / 1024);
+        reg.regionSize = buffer;
+
+        switch (mbi.State) {
+            case MEM_COMMIT:  reg.state = "Commit"; break;
+            case MEM_RESERVE: reg.state = "Reserve"; break;
+            case MEM_FREE:    reg.state = "Free"; break;
+            default:          reg.state = "Unknown"; break;
+        }
+
+        if (mbi.State == MEM_COMMIT) {
+            DWORD prot = mbi.Protect & 0xFF;
+            if (prot == PAGE_EXECUTE_READWRITE) reg.protection = "ERW (Dangerous)";
+            else if (prot == PAGE_EXECUTE_READ)  reg.protection = "ER";
+            else if (prot == PAGE_READWRITE)     reg.protection = "RW";
+            else if (prot == PAGE_READONLY)      reg.protection = "R";
+            else                                 reg.protection = "Other";
+        } else {
+            reg.protection = "-";
+        }
+
+        switch (mbi.Type) {
+            case MEM_IMAGE:   reg.type = "Image"; break;
+            case MEM_MAPPED:  reg.type = "Mapped"; break;
+            case MEM_PRIVATE: reg.type = "Private"; break;
+            default:          reg.type = "-"; break;
+        }
+
+        regions.push_back(reg);
+
+        char* nextAddress = (char*)mbi.BaseAddress + mbi.RegionSize;
+        if (nextAddress <= address) break;
+        address = nextAddress;
+    }
+    return regions;
 }
 
 std::string LoadThemeConfig() {
@@ -877,10 +940,12 @@ std::vector<ProcessInfo> GetRunningProcesses() {
 }
 
 void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DWORD& selectedPid, HWND hwnd,
-                          DWORD& memoryMapPid, bool& showMemoryMap, std::vector<MemoryRegion>& cachedMemoryRegions, std::string& memoryMapError,
-                          DWORD& modThreadsPid, bool& showModulesThreads, std::vector<ModuleInfoItem>& cachedModules, std::string& modulesError,
-                          std::vector<ThreadInfoItem>& cachedThreads, std::string& threadsError, DWORD& connectionsPid, bool& showConnections,
-                          std::vector<ConnectionInfoItem>& cachedConnections, std::string& connectionsError, std::vector<ProcessInfo>& cachedProcesses) {
+                        DWORD& memoryMapPid, bool& showMemoryMap, std::vector<MemoryRegion>& cachedMemoryRegions, std::string& memoryMapError,
+                        DWORD& modThreadsPid, bool& showModulesThreads, std::vector<ModuleInfoItem>& cachedModules, std::string& modulesError,
+                        std::vector<ThreadInfoItem>& cachedThreads, std::string& threadsError, DWORD& connectionsPid, bool& showConnections,
+                        std::vector<ConnectionInfoItem>& cachedConnections, std::string& connectionsError, std::vector<ProcessInfo>& cachedProcesses,
+                        DWORD& monitoredPidRef, HANDLE& hMonitoredProcessRef, bool& isTrackingRef, 
+                        float* liveCpuHist, float* liveMemHist, int& liveHistIndex, ULONGLONG& lastLiveTickRef) {
     
     std::string pNameLower = p.name;
     std::transform(pNameLower.begin(), pNameLower.end(), pNameLower.begin(), ::tolower);
@@ -954,6 +1019,20 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
                 DumpCriticalProcessMemory(selectedPid, customDumpPath);
             }
         }
+        if (ImGui::MenuItem("Send to Tracker")) {
+            selectedPid = p.pid;
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, FALSE, selectedPid);
+            if (hProc) {
+                if (hMonitoredProcessRef) CloseHandle(hMonitoredProcessRef);
+                hMonitoredProcessRef = hProc;
+                monitoredPidRef = selectedPid;
+                isTrackingRef = true;
+                memset(liveCpuHist, 0, 60 * sizeof(float));
+                memset(liveMemHist, 0, 60 * sizeof(float));
+                lastLiveTickRef = GetTickCount64();
+                liveHistIndex = 0;
+            }
+        }
 
         ImGui::Separator();
         if (ImGui::MenuItem("Terminate Process")) {
@@ -977,7 +1056,8 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
                                  modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                 connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses);
+                                 connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses,
+                                 monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
@@ -1889,7 +1969,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     for (const auto& p : cachedProcesses) {
                         RenderProcessTreeRow(p, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
                                             modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                            connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses);
+                                            connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses,
+                                            monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick);
                     }
                     ImGui::EndTable();
                 }
@@ -2527,6 +2608,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                         liveThreads = GetProcessThreads(monitoredPid, liveThreadsError);
                         liveConnections = GetProcessConnections(monitoredPid, liveConnectionsError);
                         liveModules = GetProcessModules(monitoredPid, liveModulesError);
+                        liveMemoryMap = GetProcessMemoryMap(hMonitoredProcess, liveMemoryError);
                         lastBehaviorPoll = currentTick;
                     }
 
@@ -2586,6 +2668,39 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                     ImGui::TableNextRow();
                                     ImGui::TableSetColumnIndex(0); ImGui::Text("%s", mod.name.c_str());
                                     ImGui::TableSetColumnIndex(1); ImGui::Text("%s", mod.path.c_str());
+                                }
+                                ImGui::EndTable();
+                            }
+                            ImGui::EndTabItem();
+                        }
+
+                        if (ImGui::BeginTabItem("Memory Map")) {
+                            ImGui::Text("Virtual Memory Regions: %zu", liveMemoryMap.size());
+                            if (ImGui::BeginTable("LiveMemMapTable", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 150))) {
+                                ImGui::TableSetupColumn("Base Address", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                                ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                                ImGui::TableSetupColumn("Protection", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                                ImGui::TableHeadersRow();
+
+                                for (const auto& reg : liveMemoryMap) {
+                                    ImGui::TableNextRow();
+                                    
+                                    bool isDangerous = (reg.protection.find("ERW") != std::string::npos);
+                                    if (isDangerous) {
+                                        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 80, 80, 255));
+                                    }
+
+                                    ImGui::TableSetColumnIndex(0); ImGui::Text("%s", reg.baseAddress.c_str());
+                                    ImGui::TableSetColumnIndex(1); ImGui::Text("%s", reg.regionSize.c_str());
+                                    ImGui::TableSetColumnIndex(2); ImGui::Text("%s", reg.state.c_str());
+                                    ImGui::TableSetColumnIndex(3); ImGui::Text("%s", reg.protection.c_str());
+                                    ImGui::TableSetColumnIndex(4); ImGui::Text("%s", reg.type.c_str());
+
+                                    if (isDangerous) {
+                                        ImGui::PopStyleColor();
+                                    }
                                 }
                                 ImGui::EndTable();
                             }
