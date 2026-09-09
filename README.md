@@ -16,11 +16,20 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 * **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
 * **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
 * **Advanced Process Inspector & Forensics:**
-  * **Virtual Memory Map:** Enumerates memory regions, states, protections, and types (`VirtualQueryEx`).
+  * **Virtual Memory Map & String Search:** Enumerates memory regions, states, protections, types (`VirtualQueryEx`), and supports real-time background string extraction and filtering across memory sections.
   * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
   * **Process Control & Incident Response:** Supports termination, command-line arguments inspection, and **Process Suspension (`NtSuspendProcess`)** to freeze malicious activities or ransomware in real-time.
+  * **Detailed Process Reports:** Generates comprehensive offline forensic text reports for targeted processes.
   * **Authenticode Code Signing Verification:** Local validation of binary digital signatures using Win32 crypto APIs to flag unsigned or untrusted executables/drivers.
   * **Process Memory Dumps:** Generates native application crash and mini-dumps (`MiniDumpWriteDump`) for offline analysis.
+* **Digital Forensics & Artifact Parsers (DFIR):**
+  * **Prefetch Analyzer:** Parses and inspects `.pf` prefetch files for execution history.
+  * **MTF Parser:** Analyzes the NTFS Master File Table (MFT) for deep file system tracking.
+  * **Registry Parser:** Inspects registry structures and hives.
+  * **Artifact Scanner:** Automated scanner for system artifacts and indicators of compromise.
+  * **Event Logs:** Parses and reviews Windows event logs.
+* **Live System Imaging:** 
+  * Initial implementation for creating live forensic ISO images (designed for offline analysis workflows; WinPE environment graphical adaptations in progress).
 * **Network & Socket Forensics:**
   * Active TCP/UDP endpoint monitoring mapped directly to owner PIDs and process names.
   * **Local Port & Heuristic Intelligence:** Built-in checks flagging anomalous or commonly abused ports (e.g., potential C2 or backdoor indicators) completely offline without third-party API dependencies.
@@ -73,7 +82,7 @@ To avoid manual configuration or heavy IDE setups, you can use the provided auto
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/Nooch98/ForensicTaskManager.git
+   git clone [https://github.com/Nooch98/ForensicTaskManager.git](https://github.com/Nooch98/ForensicTaskManager.git)
    ```
 
 2. Open PowerShell and navigate to the project directory:
