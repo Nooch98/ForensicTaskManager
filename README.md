@@ -4,26 +4,41 @@
 
 ## Technical Overview & Architecture
 
-Forensic Task Manager is a custom Windows diagnostic utility that bridges low-level operating system APIs with an accelerated immediate-mode graphical user interface (GUI). 
+Forensic Task Manager is a custom Windows diagnostic utility that bridges low-level operating system APIs with an accelerated immediate-mode graphical user interface (GUI).
 
-The application utilizes Dear ImGui with the docking branch enabled, paired with a custom skinning layer to achieve a dynamic Glassmorphism aesthetic. Graphics rendering is handled via OpenGL 3.0+, initialized directly through the native Win32 window context using `wglCreateContext`. To interface with the OS, the program queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, etc.) to extract processes, memory layouts, threads, modules, and network connections. Furthermore, to mitigate UI stuttering caused by heavy blocking Win32 calls such as `CreateToolhelp32Snapshot`, data is fetched asynchronously and updated via a timed caching loop (`refreshTimer`) rather than every single frame.
+* **UI Framework:** [Dear ImGui](https://github.com/ocornut/imgui) (Docking branch enabled) utilizing a custom skinning layer to achieve a dynamic Glassmorphism aesthetic.
+* **Graphics Backend:** OpenGL 3.0+ initialized directly through the Win32 window context (`wglCreateContext`).
+* **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, etc.) to extract process data, memory maps, threads, modules, and network connections.
+* **Data Caching Pattern:** To mitigate UI stuttering caused by heavy blocking Win32 calls (such as `CreateToolhelp32Snapshot`), data is fetched and updated via a timed caching loop (`refreshTimer`) rather than every single frame.
 
-## Core Features & Capabilities
+## Core Features
 
-### User Interface & Performance
-The user interface features a real-time adjustable transparency slider and an external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving. Performance tracking is driven by custom historical ring-buffers that monitor global and per-core CPU usage, RAM allocation, GPU metrics, Disk I/O, and network adapter activity simultaneously.
-
-### Advanced Process Inspector & Forensics
-At the heart of the diagnostic suite is a robust process inspector capable of deep system interrogation. It enumerates virtual memory regions, states, protections, and types via `VirtualQueryEx`, complemented by real-time background string extraction and filtering across memory sections. Users can inspect loaded DLL modules, base addresses, thread IDs, and base priorities. For incident response, the tool supports process termination, command-line inspection, process memory dumping (`MiniDumpWriteDump`), local Authenticode digital signature validation using Win32 crypto APIs, and real-time process suspension (`NtSuspendProcess`) to freeze malicious activities or ransomware on the spot. It also generates comprehensive offline forensic text reports for targeted processes.
-
-### Digital Forensics & Artifact Parsers (DFIR)
-The utility incorporates specialized modules for digital forensics and incident response. This includes a Prefetch Analyzer that parses and inspects `.pf` execution history files, an NTFS Master File Table (MFT) parser for deep file system tracking, a registry structure inspector, and an automated artifact scanner designed to detect system indicators of compromise alongside a dedicated Windows Event Log review tool.
-
-### Live System Imaging & Infrastructure
-The application includes an initial implementation for creating live forensic ISO images tailored for offline analysis workflows, with graphical adaptations for WinPE environments currently under active development.
-
-### Network, DLL Analysis, & System Maintenance
-Network monitoring covers active TCP/UDP endpoint mapping to owner PIDs and process names, bolstered by built-in heuristic checks that flag anomalous or commonly abused ports offline without external API dependencies. A native PE header inspector allows deep analysis of imported APIs and export symbols. Finally, the system maintenance utilities include an interactive Windows Services manager, a startup application optimizer, an environment variables inspector, an installed software manager with uninstaller execution, and automated shortcuts for temporary file cleanup, recycle bin emptying, DNS cache flushing, Winsock/IP resets, and SFC/DISM integrity scans.
+* **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
+* **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
+* **Advanced Process Inspector & Forensics:**
+  * **Virtual Memory Map & String Search:** Enumerates memory regions, states, protections, types (`VirtualQueryEx`), and supports real-time background string extraction and filtering across memory sections.
+  * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
+  * **Process Control & Incident Response:** Supports termination, command-line arguments inspection, and **Process Suspension (`NtSuspendProcess`)** to freeze malicious activities or ransomware in real-time.
+  * **Detailed Process Reports:** Generates comprehensive offline forensic text reports for targeted processes.
+  * **Authenticode Code Signing Verification:** Local validation of binary digital signatures using Win32 crypto APIs to flag unsigned or untrusted executables/drivers.
+  * **Process Memory Dumps:** Generates native application crash and mini-dumps (`MiniDumpWriteDump`) for offline analysis.
+* **Digital Forensics & Artifact Parsers (DFIR):**
+  * **Prefetch Analyzer:** Parses and inspects `.pf` prefetch files for execution history.
+  * **MTF Parser:** Analyzes the NTFS Master File Table (MFT) for deep file system tracking.
+  * **Registry Parser:** Inspects registry structures and hives.
+  * **Artifact Scanner:** Automated scanner for system artifacts and indicators of compromise.
+  * **Event Logs:** Parses and reviews Windows event logs.
+* **Live System Imaging:** 
+  * Initial implementation for creating live forensic ISO images (designed for offline analysis workflows; WinPE environment graphical adaptations in progress).
+* **Network & Socket Forensics:**
+  * Active TCP/UDP endpoint monitoring mapped directly to owner PIDs and process names.
+  * **Local Port & Heuristic Intelligence:** Built-in checks flagging anomalous or commonly abused ports (e.g., potential C2 or backdoor indicators) completely offline without third-party API dependencies.
+* **DLL Dependency Viewer:** Inspects native Portable Executable (PE) headers, imported APIs, and export symbols.
+* **System Maintenance & Utilities:** 
+  * **Windows Services Manager:** Interactive control to query, start, and stop system services.
+  * **Startup & Installed Software:** Startup application optimizer, environment variables inspector, and installed software manager with uninstaller execution.
+  * **Windows Installer Analyzer (`C:\Windows\Installer` Audit):** Deep inspection tool utilizing MSI APIs and Windows Registry cross-referencing (`UserData` and `Classes`) to safely audit cached packages (`.msi`, `.msp`) and unassociated directories, identifying active versus orphaned items for forensic storage footprint evaluation without risking system stability.
+  * **Quick System Maintenance:** Built-in shortcuts for temporary file cleanup, recycle bin emptying, DNS cache flushing, Winsock/IP resets, and automated SFC/DISM system integrity scans.
 
 ## Gallery
 
@@ -79,9 +94,13 @@ Network monitoring covers active TCP/UDP endpoint mapping to owner PIDs and proc
     </td>
   </tr>
   <tr>
-    <td align="center" width="50%" colspan="2">
+    <td align="center" width="50%">
       <img width="1919" height="1079" src="https://github.com/user-attachments/assets/5d5d6377-4488-4573-b51a-8c373813522e" alt="Artifact Scanner" /><br/>
       <sub><b>Artifact Scanner</b><br/><i>Automated System Artifacts & Indicators of Compromise</i></sub>
+    </td>
+    <td align="center" width="50%">
+      <img width="1918" height="1048" src="https://github.com/user-attachments/assets/cda864c8-dc90-4431-b89c-cd9e967be69e" alt="Installer Folder Analyzer" /><br/>
+      <sub><b>Windows Installer Analyzer</b><br/><i>Cached Package Audit & Registry Cross-Referencing</i></sub>
     </td>
   </tr>
 </table>
@@ -121,3 +140,4 @@ To avoid manual configuration or heavy IDE setups, you can use the provided auto
     ```bash
     .\build.ps1
     ```
+<img width="1918" height="1048" alt="Captura de pantalla 2026-09-10 172259" src="https://github.com/user-attachments/assets/de7d97bf-be91-4a22-9afd-a34d696cd3c4" />
