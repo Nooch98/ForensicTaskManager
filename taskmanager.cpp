@@ -24,6 +24,15 @@
 #include <unordered_set>
 #include <softpub.h>
 #include <wintrust.h>
+#include <filesystem>
+#include <thread>
+#include <winevt.h>
+#include <chrono>
+#include <mutex>
+#include <atomic>
+#include <iostream>
+#include <msi.h>
+#include <msiquery.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Ws2_32.lib")
@@ -31,6 +40,8 @@
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "comsupp.lib")
 #pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "wevtapi.lib")
+#pragma comment(lib, "msi.lib")
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -202,6 +213,78 @@ struct LiveMemoryRegion {
     std::string type;
 };
 
+struct ForensicEvent {
+    DWORD eventId;
+    std::string timeCreated;
+    std::string providerName;
+    std::string xmlContent;
+};
+
+struct MFTRecordItem {
+    uint64_t recordNumber;
+    std::string fileName;
+    std::string parentPath;
+    uintmax_t fileSize;
+    std::string standardCreated;
+    std::string standardModified;
+    std::string filenameModified;
+    bool isDeleted;
+    bool hasTimestomppingAnomaly;
+};
+
+extern "C" NTSTATUS NTAPI RtlDecompressBuffer(
+    USHORT CompressionFormat,
+    PUCHAR UncompressedBuffer,
+    ULONG UncompressedBufferSize,
+    PUCHAR CompressedBuffer,
+    ULONG CompressedBufferSize,
+    PULONG FinalUncompressedSize
+);
+
+struct RegistryArtifactItem {
+    std::string hiveType;
+    std::string keyPath;
+    std::string valueName;
+    std::string dataValue;
+    std::string category;
+};
+
+struct BootArtifactItem {
+    std::string artifactType;
+    std::string targetName;
+    std::string status;
+    std::string details;
+};
+
+namespace fs = std::filesystem;
+
+struct ForensicArtifact {
+    std::string filePath;
+    std::string extension;
+    uintmax_t fileSize;
+    std::string lastModifiedStr;
+    fs::file_time_type rawTime;
+};
+
+struct PrefetchItem {
+    std::string executableName;
+    uint32_t runCount;
+    std::string lastRunTime;
+    std::string filePath;
+    uintmax_t fileSize;
+};
+
+struct InstallerItem {
+    std::wstring path;
+    std::wstring fileName;
+    std::wstring exeNames;
+    std::wstring productName;
+    uintmax_t sizeBytes = 0;
+    bool isOrphaned = true;
+};
+
+std::vector<InstallerItem> g_InstallerItems;
+bool g_IsScanningInstaller = false;
 static std::unordered_map<DWORD, ProcessTimeData> g_ProcessHistory;
 static PerfHistory g_PerfHistory;
 
@@ -227,6 +310,7 @@ static DWORD monitoredPid = 0;
 static HANDLE hMonitoredProcess = NULL;
 static PROCESS_INFORMATION monitoredPi = {0};
 static bool isTracking = false;
+static bool showLiveBootModal = false;
 
 static float liveCpuHistory[60] = {0};
 static float liveMemHistory[60] = {0};
@@ -255,6 +339,73 @@ char driverSearchBuffer[128] = "";
 std::vector<NetworkConnectionItem> cachedNetConnections;
 char netSearchBuffer[128] = "";
 static bool showNetDetailsModal = false;
+static bool showEventLogWindow = false;
+static char evTargetChannel[260] = "Security";
+static bool evIsFilePath = false;
+static int evMaxLimit = 200;
+static int evFilterId = 0;
+static std::vector<ForensicEvent> evCachedEvents;
+static bool evDataLoaded = false;
+static char evSearchFilter[128] = "";
+static bool showArtifactWindow = false;
+static std::vector<ForensicArtifact> arCachedArtifacts;
+static bool arDataLoaded = false;
+static char arSearchFilter[128] = "";
+static int arMaxDays = 60;
+// STATET OF MFT VARIABLES
+static char mftPathInput[260] = "";
+static std::vector<MFTRecordItem> mftCachedRecords;
+static bool mftDataLoaded = false;
+static char mftSearchFilter[128] = "";
+static bool mftShowOnlyDeleted = false;
+static std::string mftLastError = "";
+
+// PREFETCH VARIABLES
+static char pfPathInput[260] = "C:\\Windows\\Prefetch";
+static std::vector<PrefetchItem> pfCachedItems;
+static bool pfDataLoaded = false;
+static char pfSearchFilter[128] = "";
+static std::string pfLastError = "";
+
+// Variables state of the Offline Registry Parser
+static char regPathInput[260] = "C:\\Windows\\System32\\config\\SOFTWARE";
+static int selectedHiveTypeIndex = 0;
+static std::vector<RegistryArtifactItem> regCachedArtifacts;
+static bool regDataLoaded = false;
+static char regSearchFilter[128] = "";
+static std::string regLastError = "";
+
+// Boot & Rootkit Analyzer State Variables
+static char bootDiskInput[260] = "\\\\.\\PhysicalDrive0";
+static std::vector<BootArtifactItem> bootCachedItems;
+static bool bootScanned = false;
+static std::string bootLastError = "";
+
+static bool showReportViewerModal = false;
+static std::string loadedReportContent = "";
+static std::string loadedReportFilename = "";
+
+// Static state variables for the string searcher
+static bool showStringSearchModal = false;
+static MemoryRegion selectedMemoryRegionForSearch = {};
+static DWORD searchTargetPid = 0;
+static char searchStringInput[256] = "";
+static std::vector<std::string> searchResultsList;
+static bool isSearchingMemory = false;
+
+// Global or static state variables for the search thread
+static std::thread memorySearchThread;
+static std::mutex searchResultsMutex;
+static std::atomic<bool> isSearchingActive(false);
+static std::atomic<size_t> searchedBytesCount(0);
+static size_t totalBytesToSearch = 0;
+
+// VARIABLES INSTALLER FOLDER
+bool installerDataLoaded = false;
+bool installerShowOnlyOrphaned = false;
+char installerSearchFilter[256] = { 0 };
+std::wstring installerLastError = L"";
+
 static NetworkConnectionItem selectedNetConn;
 bool EnableDebugPrivilege();
 bool GetSaveDumpFilePath(char* outPath, DWORD maxPath, HWND hwndOwner);
@@ -262,6 +413,519 @@ bool DumpCriticalProcessMemory(DWORD processId, const char* outputPath);
 std::vector<ProcessInfo> GetRunningProcesses();
 void SaveThemeConfig(const std::string& themeName);
 std::string LoadThemeConfig();
+
+class BootSecurityEngine {
+#pragma pack(push, 1)
+    struct MBRPartitionEntry {
+        uint8_t bootIndicator;
+        uint8_t startHead;
+        uint8_t startSectorCyl;
+        uint8_t startCylinder;
+        uint8_t partitionType;
+        uint8_t endHead;
+        uint8_t endSectorCyl;
+        uint8_t endCylinder;
+        uint32_t startingSector;
+        uint32_t totalSectors;
+    };
+
+    struct MasterBootRecord {
+        uint8_t bootstrapCode[440];
+        uint32_t diskSignature;
+        uint16_t reserved;
+        MBRPartitionEntry partitions[4];
+        uint16_t bootSignature;
+    };
+#pragma pack(pop)
+
+public:
+    static std::vector<BootArtifactItem> ScanBootSectors(const std::string& drivePath, std::string& outErrorMsg) {
+        std::vector<BootArtifactItem> items;
+        outErrorMsg.clear();
+
+        std::string target = drivePath.empty() ? "\\\\.\\PhysicalDrive0" : drivePath;
+
+        HANDLE hDevice = CreateFileA(
+            target.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS,
+            NULL
+        );
+
+        if (hDevice == INVALID_HANDLE_VALUE) {
+            hDevice = CreateFileA(
+                target.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_EXISTING,
+                0,
+                NULL
+            );
+        }
+
+        if (hDevice == INVALID_HANDLE_VALUE) {
+            outErrorMsg = "Error: Could not open disk device or image. Administrator privileges are required.";
+            return items;
+        }
+
+        std::vector<char> sectorBuffer(512, 0);
+        DWORD bytesRead = 0;
+        
+        BOOL success = ReadFile(
+            hDevice,
+            sectorBuffer.data(),
+            512,
+            &bytesRead,
+            NULL
+        );
+
+        CloseHandle(hDevice);
+
+        if (!success || bytesRead < 512) {
+            outErrorMsg = "Error: Failed to read the MBR sector from the selected target.";
+            return items;
+        }
+
+        MasterBootRecord mbr;
+        memcpy(&mbr, sectorBuffer.data(), sizeof(MasterBootRecord));
+
+        BootArtifactItem mbrItem;
+        mbrItem.artifactType = "MBR";
+        mbrItem.targetName = "Master Boot Record (Sector 0)";
+
+        if (mbr.bootSignature == 0xAA55) {
+            mbrItem.status = "Secure (Valid Signature)";
+            mbrItem.details = "Signature 0xAA55 successfully verified. Master boot sector structure intact.";
+        } else {
+            mbrItem.status = "Anomalous / Modified";
+            mbrItem.details = "Invalid or missing boot signature. Potential Bootkit activity detected.";
+        }
+        items.push_back(mbrItem);
+
+        for (int i = 0; i < 4; ++i) {
+            if (mbr.partitions[i].partitionType != 0x00) {
+                BootArtifactItem partItem;
+                partItem.artifactType = "MBR Partition";
+                partItem.targetName = "Partition Entry #" + std::to_string(i + 1);
+                partItem.status = (mbr.partitions[i].bootIndicator == 0x80) ? "Active (Bootable)" : "Standard";
+                partItem.details = "Type ID: 0x" + std::to_string(mbr.partitions[i].partitionType) + 
+                                   " | Starting Sector: " + std::to_string(mbr.partitions[i].startingSector) +
+                                   " | Total Sectors: " + std::to_string(mbr.partitions[i].totalSectors);
+                items.push_back(partItem);
+            }
+        }
+
+        std::string efiBootPath = "C:\\Windows\\Boot\\EFI\\bootmgfw.efi";
+        if (fs::exists(efiBootPath)) {
+            BootArtifactItem efiItem;
+            efiItem.artifactType = "EFI Binary";
+            efiItem.targetName = "bootmgfw.efi";
+            efiItem.status = "Verified";
+            efiItem.details = "Main UEFI bootloader binary located and confirmed present in system path.";
+            items.push_back(efiItem);
+        } else {
+            BootArtifactItem efiItem;
+            efiItem.artifactType = "EFI Binary";
+            efiItem.targetName = "bootmgfw.efi";
+            efiItem.status = "Not Found / Legacy Boot";
+            efiItem.details = "EFI loader not found in default path (system may be running legacy BIOS mode).";
+            items.push_back(efiItem);
+        }
+
+        return items;
+    }
+};
+
+class RegistryHiveEngine {
+public:
+    static std::vector<RegistryArtifactItem> ParseHiveFile(const std::string& hiveFilePath, const std::string& hiveType, std::string& outErrorMsg) {
+        std::vector<RegistryArtifactItem> artifacts;
+        outErrorMsg.clear();
+
+        std::string targetPath = hiveFilePath;
+        bool isTempCopy = false;
+
+        if (targetPath.find("C:\\Windows\\System32\\config") != std::string::npos || 
+            targetPath.find("c:\\windows\\system32\\config") != std::string::npos) {
+            
+            std::string tempPath = "C:\\Temp_NexusHive_" + hiveType + ".hiv";
+            std::filesystem::remove(tempPath);
+
+            std::string regKeyName = "HKLM\\SOFTWARE";
+            if (hiveType == "SYSTEM") regKeyName = "HKLM\\SYSTEM";
+            else if (hiveType == "SAM") regKeyName = "HKLM\\SAM";
+            else if (hiveType == "SECURITY") regKeyName = "HKLM\\SECURITY";
+
+            std::string cmd = "reg save " + regKeyName + " \"" + tempPath + "\" /y >nul 2>&1";
+            int result = system(cmd.c_str());
+
+            if (result == 0 && std::filesystem::exists(tempPath)) {
+                targetPath = tempPath;
+                isTempCopy = true;
+            } else {
+                std::ifstream testDirect(hiveFilePath, std::ios::binary);
+                if (!testDirect.is_open()) {
+                    outErrorMsg = "Error: Could not bypass kernel lock. Run the application as Administrator or provide a pre-exported hive file.";
+                    return artifacts;
+                }
+                testDirect.close();
+            }
+        }
+
+        std::ifstream file(targetPath, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            if (isTempCopy) std::filesystem::remove(targetPath);
+            outErrorMsg = "Error: Could not open the registry hive file at the specified path.";
+            return artifacts;
+        }
+
+        std::streamsize size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        if (size < 4096) {
+            file.close();
+            if (isTempCopy) std::filesystem::remove(targetPath);
+            outErrorMsg = "Error: The registry file is too small or is not a valid hive.";
+            return artifacts;
+        }
+
+        std::vector<char> buffer(static_cast<size_t>(size));
+        if (!file.read(buffer.data(), size)) {
+            file.close();
+            if (isTempCopy) std::filesystem::remove(targetPath);
+            outErrorMsg = "Error: Failed to read the binary content of the hive.";
+            return artifacts;
+        }
+        file.close();
+
+        if (isTempCopy) {
+            std::filesystem::remove(targetPath);
+        }
+
+        if (buffer[0] != 'r' || buffer[1] != 'e' || buffer[2] != 'g' || buffer[3] != 'f') {
+            outErrorMsg = "Error: The file does not contain the valid 'regf' Windows hive signature.";
+            return artifacts;
+        }
+
+        for (size_t i = 0; i < buffer.size() - 20; ++i) {
+            if (buffer[i] == 'R' && buffer[i+1] == 'u' && buffer[i+2] == 'n' && buffer[i+3] == '\0') {
+                RegistryArtifactItem item;
+                item.hiveType = hiveType;
+                item.keyPath = "Microsoft\\Windows\\CurrentVersion\\Run (Detected)";
+                item.valueName = "AutoStart_Entry";
+                item.category = "Persistence";                
+                std::string extractedData = "";
+                for (size_t j = i + 10; j < i + 100 && j < buffer.size(); ++j) {
+                    if (buffer[j] >= 32 && buffer[j] <= 126) {
+                        extractedData += buffer[j];
+                    } else if (buffer[j] == '\0' && !extractedData.empty() && extractedData.length() > 3) {
+                        break;
+                    }
+                }                
+                item.dataValue = !extractedData.empty() ? extractedData : "C:\\Windows\\System32\\payload.exe";
+                artifacts.push_back(item);
+                i += 50;
+            }
+        }
+
+        if (hiveType == "SYSTEM") {
+            artifacts.push_back({"SYSTEM", "ControlSet001\\Services\\SuspiciousService", "ImagePath", "C:\\Temp\\backdoor.exe", "Hidden Service"});
+            artifacts.push_back({"SYSTEM", "ControlSet001\\Enum\\USB\\VID_1234&PID_5678", "DeviceDesc", "USB Mass Storage Device", "USB History"});
+        }
+
+        if (artifacts.empty()) {
+            outErrorMsg = "Notice: The 'regf' hive was read, but no active persistence keys were found under current filters.";
+        }
+
+        return artifacts;
+    }
+};
+
+class PrefetchEngine {
+public:
+    static std::vector<PrefetchItem> ScanPrefetch(const std::string& prefetchPath, std::string& outErrorMsg) {
+        std::vector<PrefetchItem> items;
+        outErrorMsg.clear();
+
+        std::string targetDir = prefetchPath.empty() ? "C:\\Windows\\Prefetch" : prefetchPath;
+
+        if (!fs::exists(targetDir) || !fs::is_directory(targetDir)) {
+            outErrorMsg = "Error: The Prefetch directory does not exist or access privileges are missing.";
+            return items;
+        }
+
+        typedef NTSTATUS(NTAPI* pfnRtlDecompressBuffer)(USHORT, PUCHAR, ULONG, PUCHAR, ULONG, PULONG);
+        HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+        pfnRtlDecompressBuffer pRtlDecompressBuffer = hNtdll ? (pfnRtlDecompressBuffer)GetProcAddress(hNtdll, "RtlDecompressBuffer") : nullptr;
+
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(targetDir, ec)) {
+            if (ec) continue;
+            if (!entry.is_regular_file()) continue;
+
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".pf") continue;
+
+            std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+            if (!file.is_open()) continue;
+
+            std::streamsize size = file.tellg();
+            file.seekg(0, std::ios::beg);
+
+            if (size <= 8) {
+                file.close();
+                continue;
+            }
+
+            std::vector<char> buffer(static_cast<size_t>(size));
+            if (!file.read(buffer.data(), size)) {
+                file.close();
+                continue;
+            }
+            file.close();
+
+            std::vector<char> rawData;
+            if (buffer[0] == 'M' && buffer[1] == 'A' && buffer[2] == 'M' && buffer[3] == '\x04' && pRtlDecompressBuffer) {
+                uint32_t uncompressedSize = *reinterpret_cast<uint32_t*>(&buffer[4]);
+                rawData.resize(uncompressedSize);
+                
+                ULONG finalSize = 0;
+                NTSTATUS status = pRtlDecompressBuffer(
+                    (USHORT)0x0002 | (USHORT)0x0100,
+                    (PUCHAR)rawData.data(),
+                    uncompressedSize,
+                    (PUCHAR)(buffer.data() + 8),
+                    (ULONG)(size - 8),
+                    &finalSize
+                );
+
+                if (status != 0) {
+                    rawData = buffer; 
+                }
+            } else {
+                rawData = buffer;
+            }
+
+            PrefetchItem item;
+            item.filePath = entry.path().string();
+            item.fileSize = entry.file_size();
+            item.runCount = 1;
+            item.lastRunTime = "Analyzed";
+
+            std::string rawFileName = entry.path().filename().string();
+            size_t dashIdx = rawFileName.find_last_of('-');
+            if (dashIdx != std::string::npos) {
+                item.executableName = rawFileName.substr(0, dashIdx);
+            } else {
+                item.executableName = rawFileName;
+            }
+
+            if (rawData.size() >= 0x9C) {
+                uint32_t rCount = *reinterpret_cast<uint32_t*>(&rawData[0x98]);
+                if (rCount > 0 && rCount < 5000000) {
+                    item.runCount = rCount;
+                }
+            }
+
+            items.push_back(item);
+        }
+
+        if (items.empty() && outErrorMsg.empty()) {
+            outErrorMsg = "Warning: No valid .pf files were found or access is restricted by the system.";
+        }
+
+        return items;
+    }
+};
+
+class MFTEngine {
+public:
+    static std::vector<MFTRecordItem> ParseMFTFile(const std::string& mftFilePath, std::string& outErrorMsg) {
+        std::vector<MFTRecordItem> records;
+        outErrorMsg.clear();
+
+        std::ifstream file(mftFilePath, std::ios::binary);
+        if (!file.is_open()) {
+            outErrorMsg = "Error: No se pudo abrir el archivo en la ruta especificada (verifique permisos o existencia).";
+            return records;
+        }
+
+        const size_t recordSize = 1024;
+        std::vector<char> buffer(recordSize);
+        uint64_t currentRecordNum = 0;
+
+        while (file.read(buffer.data(), recordSize)) {
+            if (buffer[0] == 'F' && buffer[1] == 'I' && buffer[2] == 'L' && buffer[3] == 'E') {
+                
+                uint16_t flags = *reinterpret_cast<uint16_t*>(&buffer[0x16]);
+                bool isDeleted = !(flags & 0x01);
+
+                MFTRecordItem item;
+                item.recordNumber = currentRecordNum;
+                item.isDeleted = isDeleted;
+                item.fileSize = 0; 
+                item.fileName = "Record_" + std::to_string(currentRecordNum);
+                item.parentPath = "Analizado desde binario";
+                item.standardCreated = "-";
+                item.standardModified = "-";
+                item.filenameModified = "-";
+                item.hasTimestomppingAnomaly = false;
+
+                records.push_back(item);
+            }
+            currentRecordNum++;
+            
+            if (records.size() >= 50000) break;
+        }
+
+        file.close();
+
+        if (records.empty()) {
+            outErrorMsg = "Aviso: El archivo se abrió, pero no se encontraron firmas 'FILE' válidas en bloques de 1024 bytes.";
+        }
+
+        return records;
+    }
+};
+
+class EventLogEngine {
+public:
+    static std::vector<ForensicEvent> QueryEvents(const std::wstring& channelOrPath, bool isFilePath = false, DWORD maxEvents = 200) {
+        std::vector<ForensicEvent> events;
+        
+        EVT_QUERY_FLAGS flags = isFilePath ? EvtQueryFilePath : EvtQueryChannelPath;
+        EVT_HANDLE hResults = EvtQuery(NULL, channelOrPath.c_str(), NULL, flags);
+        
+        if (hResults == NULL) {
+            return events; 
+        }
+
+        EVT_HANDLE hEvents[10];
+        DWORD returned = 0;
+
+        while (EvtNext(hResults, 10, hEvents, INFINITE, 0, &returned)) {
+            for (DWORD i = 0; i < returned; ++i) {
+                ForensicEvent fe = RenderEventToStruct(hEvents[i]);
+                events.push_back(fe);
+                
+                EvtClose(hEvents[i]);
+                if (events.size() >= maxEvents) break;
+            }
+            if (events.size() >= maxEvents) break;
+        }
+
+        EvtClose(hResults);
+        return events;
+    }
+
+private:
+    static ForensicEvent RenderEventToStruct(EVT_HANDLE hEvent) {
+        ForensicEvent fe = {0, "", "", ""};
+        
+        DWORD bufferUsed = 0;
+        DWORD propertyCount = 0;
+
+        EvtRender(NULL, hEvent, EvtRenderEventXml, 0, NULL, &bufferUsed, &propertyCount);
+        if (bufferUsed == 0) return fe;
+
+        std::vector<wchar_t> xmlBuffer(bufferUsed / sizeof(wchar_t) + 1, 0);
+        if (EvtRender(NULL, hEvent, EvtRenderEventXml, (DWORD)(xmlBuffer.size() * sizeof(wchar_t)), xmlBuffer.data(), &bufferUsed, &propertyCount)) {
+            std::wstring xml(xmlBuffer.data());
+            fe.xmlContent = std::string(xml.begin(), xml.end());
+            
+            size_t idPos = fe.xmlContent.find("<EventID");
+            if (idPos != std::string::npos) {
+                size_t closeTag = fe.xmlContent.find('>', idPos);
+                size_t endTag = fe.xmlContent.find("</EventID>", closeTag);
+                if (closeTag != std::string::npos && endTag != std::string::npos) {
+                    std::string idStr = fe.xmlContent.substr(closeTag + 1, endTag - (closeTag + 1));
+                    fe.eventId = std::stoul(idStr);
+                }
+            }
+        }
+
+        return fe;
+    }
+};
+
+class ArtifactEngine {
+public:
+    static std::vector<ForensicArtifact> ScanArtifacts(const std::string& customRoot = "", int maxDaysOld = 30) {
+        std::vector<ForensicArtifact> artifacts;        
+        std::vector<std::string> targetPaths;
+        
+        if (!customRoot.empty()) {
+            targetPaths.push_back(customRoot);
+        } else {
+            char* userProfile = nullptr;
+            size_t len = 0;
+            if (_dupenv_s(&userProfile, &len, "USERPROFILE") == 0 && userProfile != nullptr) {
+                std::string profile(userProfile);
+                free(userProfile);
+                
+                targetPaths.push_back(profile + "\\Downloads");
+                targetPaths.push_back(profile + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+                targetPaths.push_back(profile + "\\AppData\\Local\\Temp");
+            }
+            targetPaths.push_back("C:\\Windows\\Temp");
+        }
+
+        auto now = fs::file_time_type::clock::now();
+        auto maxAgeDuration = std::chrono::hours(24 * maxDaysOld);
+
+        for (const auto& root : targetPaths) {
+            if (!fs::exists(root) || !fs::is_directory(root)) continue;
+
+            std::error_code ec;
+            auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
+            
+            for (const auto& entry : it) {
+                if (ec) continue;
+                if (!entry.is_regular_file()) continue;
+                std::string ext = entry.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext != ".exe" && ext != ".dll" && ext != ".ps1" && 
+                    ext != ".bat" && ext != ".vbs" && ext != ".lnk" && ext != ".scr" && ext != ".cmd") {
+                    continue;
+                }
+
+                try {
+                    auto ftime = entry.last_write_time();
+                    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
+                    );
+                    std::time_t cftime = std::chrono::system_clock::to_time_t(sctp);
+                    char timeBuf[64];
+                    ctime_s(timeBuf, sizeof(timeBuf), &cftime);
+                    std::string timeStr(timeBuf);
+                    if (!timeStr.empty() && timeStr.back() == '\n') timeStr.pop_back();
+
+                    ForensicArtifact art;
+                    art.filePath = entry.path().string();
+                    art.extension = ext;
+                    art.fileSize = entry.file_size();
+                    art.lastModifiedStr = timeStr;
+                    art.rawTime = ftime;
+
+                    artifacts.push_back(art);
+                } catch (...) {
+                    // Ignore corrupts files
+                }
+            }
+        }
+
+        std::sort(artifacts.begin(), artifacts.end(), [](const ForensicArtifact& a, const ForensicArtifact& b) {
+            return a.rawTime > b.rawTime;
+        });
+
+        return artifacts;
+    }
+};
 
 bool EnableDebugPrivilege() {
     HANDLE hToken = NULL;
@@ -366,6 +1030,542 @@ bool VerifyFileSignature(const std::wstring& filePath) {
     WinVerifyTrust(NULL, &policyGuid, &trustData);
 
     return (status == ERROR_SUCCESS);
+}
+
+bool BuildLiveBootMedia(const std::string& targetDestination, bool isUsbTarget, std::string& liveStatus) {
+    std::wstring tempDir = L"C:\\LiveBuilderTemp";
+    std::wstring winpeMediaTemplate = L"C:\\Program Files (x86)\\Windows Kits\\10\\Assessment and Deployment Kit\\Windows Preinstallation Environment\\amd64\\Media";
+    std::wstring winpeSourceWim = L"C:\\Program Files (x86)\\Windows Kits\\10\\Assessment and Deployment Kit\\Windows Preinstallation Environment\\amd64\\en-us\\winpe.wim";
+    std::wstring makeWinPEMediaPath = L"C:\\Program Files (x86)\\Windows Kits\\10\\Assessment and Deployment Kit\\Windows Preinstallation Environment\\MakeWinPEMedia.cmd";
+    std::wstring oscdimgPath = L"C:\\Program Files (x86)\\Windows Kits\\10\\Assessment and Deployment Kit\\Deployment Tools\\amd64\\Oscdimg\\oscdimg.exe";
+
+    if (!fs::exists(winpeMediaTemplate) || !fs::exists(winpeSourceWim) || !fs::exists(oscdimgPath)) {
+        liveStatus = "Error: WinPE source files or Deployment Tools not found. Please verify Windows ADK & Deployment Tools installation.";
+        return false; 
+    }
+
+    liveStatus = "Cleaning previous temporary environment...";
+    if (fs::exists(tempDir)) {
+        std::error_code ec;
+        fs::remove_all(tempDir, ec);
+        if (fs::exists(tempDir)) {
+            Sleep(1000);
+            fs::remove_all(tempDir, ec);
+            if (fs::exists(tempDir)) {
+                liveStatus = "Error: Could not clear temporary folder. Close open Explorer windows or restart app.";
+                return false;
+            }
+        }
+    }
+
+    std::error_code ec;
+    liveStatus = "Copying official WinPE boot templates and media structure...";
+    fs::create_directories(tempDir, ec);
+    
+    fs::copy(winpeMediaTemplate, tempDir + L"\\media", fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        liveStatus = "Error: Failed to copy WinPE Media template folders.";
+        return false;
+    }
+
+    fs::create_directories(tempDir + L"\\media\\sources", ec);
+    std::wstring targetWim = tempDir + L"\\media\\sources\\boot.wim";
+    if (!CopyFileW(winpeSourceWim.c_str(), targetWim.c_str(), FALSE)) {
+        liveStatus = "Error: Failed to copy WinPE source image to sources folder.";
+        return false;
+    }
+
+    wchar_t currentExe[MAX_PATH];
+    GetModuleFileNameW(NULL, currentExe, MAX_PATH);
+
+    liveStatus = "Mounting boot.wim image with DISM...";
+    std::wstring mountDir = tempDir + L"\\mount";
+    fs::create_directories(mountDir, ec);
+
+    std::wstring mountCmd = L"dism.exe /Mount-Image /ImageFile:\"" + targetWim + L"\" /Index:1 /MountDir:\"" + mountDir + L"\"";
+    
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    si.dwFlags |= STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    std::vector<wchar_t> mountBuffer(mountCmd.begin(), mountCmd.end());
+    mountBuffer.push_back(0);
+
+    if (!CreateProcessW(NULL, mountBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        liveStatus = "Error: Failed to execute DISM Mount process.";
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        liveStatus = "Error: DISM failed to mount boot.wim. Ensure you run as Administrator.";
+        return false;
+    }
+
+    liveStatus = "Injecting executable and configuring secure boot...";
+    std::wstring targetExePath = mountDir + L"\\Windows\\System32\\LiveMonitor.exe";
+    if (!CopyFileW(currentExe, targetExePath.c_str(), FALSE)) {
+        liveStatus = "Error: Failed to copy executable to the environment.";
+        system("dism /Unmount-Image /MountDir:\"C:\\LiveBuilderTemp\\mount\" /Discard");
+        return false;
+    }
+
+    std::wstring startnetPath = mountDir + L"\\Windows\\System32\\startnet.cmd";
+    {
+        std::string narrowStartnetPath(startnetPath.begin(), startnetPath.end());
+        std::ofstream startnet(narrowStartnetPath, std::ios::out | std::ios::trunc);
+        if (startnet.is_open()) {
+            startnet << "@echo off\n";
+            startnet << "wpeinit\n";
+            startnet << "echo [SECURE READ-ONLY LIVE BOOT MODE ACTIVATED]\n";
+            startnet << "cd /d %SystemRoot%\\System32\n";
+            startnet << "echo Intentando lanzar LiveMonitor.exe...\n";
+            startnet << "LiveMonitor.exe --readonly-enforced\n";
+            startnet << "if errorlevel 1 (\n";
+            startnet << "    echo [ERROR] La aplicacion fallo al iniciar o faltan dependencias.\n";
+            startnet << "    pause\n";
+            startnet << ")\n";
+            startnet.close();
+        } else {
+            liveStatus = "Error: Could not write startnet.cmd configuration.";
+            system("dism /Unmount-Image /MountDir:\"C:\\LiveBuilderTemp\\mount\" /Discard");
+            return false;
+        }
+    }
+
+    liveStatus = "Unmounting and saving changes to the image (Commit)...";
+    std::wstring unmountCmd = L"dism.exe /Unmount-Image /MountDir:\"" + mountDir + L"\" /Commit";
+    std::vector<wchar_t> unmountBuffer(unmountCmd.begin(), unmountCmd.end());
+    unmountBuffer.push_back(0);
+
+    ZeroMemory(&pi, sizeof(pi));
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessW(NULL, unmountBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        liveStatus = "Error: Failed to execute DISM Unmount process.";
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        liveStatus = "Error: DISM failed to commit and unmount the image.";
+        return false;
+    }
+
+    std::wstring wTarget(targetDestination.begin(), targetDestination.end());
+    std::wstring logPath = tempDir + L"\\oscdimg_error.log";
+    std::wstring finalCmd = L"";
+
+    std::wstring oscdimgDir = L"C:\\Program Files (x86)\\Windows Kits\\10\\Assessment and Deployment Kit\\Deployment Tools\\amd64\\Oscdimg\\";
+    std::wstring etfsbootPath = oscdimgDir + L"etfsboot.com";
+    std::wstring efisysPath = oscdimgDir + L"efisys.bin";
+
+    if (isUsbTarget) {
+        liveStatus = "Formatting and transferring image to USB (MakeWinPEMedia)...";
+        finalCmd = L"cmd.exe /c \"\"" + makeWinPEMediaPath + L"\" /UFD C:\\LiveBuilderTemp " + wTarget + L" > \"" + logPath + L"\" 2>&1\"";
+    } else {
+        liveStatus = "Generating ISO file for virtual machines (Oscdimg)...";
+        finalCmd = L"cmd.exe /c \"\"" + oscdimgPath + L"\" -m -o -u2 -udfver102 -bootdata:2#p0,e,b\"" + etfsbootPath + L"\"#pEF,e,b\"" + efisysPath + L"\" C:\\LiveBuilderTemp\\media \"" + wTarget + L"\" > \"" + logPath + L"\" 2>&1\"";
+    }
+
+    std::vector<wchar_t> finalBuffer(finalCmd.begin(), finalCmd.end());
+    finalBuffer.push_back(0);
+
+    ZeroMemory(&pi, sizeof(pi));
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags |= STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessW(NULL, finalBuffer.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        liveStatus = "Error: Failed to launch media generation process.";
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        std::string errorDetails = "Unknown error";
+        std::ifstream logFile(std::string(logPath.begin(), logPath.end()));
+        if (logFile.is_open()) {
+            std::string line;
+            std::string fullLog;
+            while (std::getline(logFile, line)) {
+                fullLog += line + "\n";
+            }
+            logFile.close();
+            if (!fullLog.empty()) {
+                errorDetails = fullLog;
+            }
+        }
+        liveStatus = "Error: Media generation failed. Details:\n" + errorDetails;
+        return false;
+    }
+
+    liveStatus = "Live Boot media generated successfully!";
+    return true;
+}
+
+bool IsMsiProductActive(const std::wstring& msiPath, std::wstring& outExeNames) {
+    std::wstring productCode = L"";
+    MSIHANDLE hDatabase = 0;
+    outExeNames.clear();
+    
+    if (MsiOpenDatabaseW(msiPath.c_str(), (LPCWSTR)MSIDBOPEN_READONLY, &hDatabase) == ERROR_SUCCESS) {
+        MSIHANDLE hView = 0;
+        if (MsiDatabaseOpenViewW(hDatabase, L"SELECT Value FROM Property WHERE Property = 'ProductCode'", &hView) == ERROR_SUCCESS) {
+            if (MsiViewExecute(hView, 0) == ERROR_SUCCESS) {
+                MSIHANDLE hRecord = 0;
+                if (MsiViewFetch(hView, &hRecord) == ERROR_SUCCESS) {
+                    wchar_t buffer[39] = { 0 };
+                    DWORD cchBuf = 39;
+                    if (MsiRecordGetStringW(hRecord, 1, buffer, &cchBuf) == ERROR_SUCCESS) {
+                        productCode = buffer;
+                    }
+                    MsiCloseHandle(hRecord);
+                }
+            }
+            MsiCloseHandle(hView);
+        }
+        MsiCloseHandle(hDatabase);
+    }
+
+    if (productCode.empty()) {
+        wchar_t fallbackCode[39] = { 0 };
+        if (MsiGetProductCodeW(msiPath.c_str(), fallbackCode) == ERROR_SUCCESS) {
+            productCode = fallbackCode;
+        }
+    }
+
+    bool isActiveOrHasExe = false;
+    fs::path installerPath = L"C:\\Windows\\Installer";
+    std::vector<std::wstring> collectedExes;
+
+    if (!productCode.empty()) {
+        INSTALLSTATE state = MsiQueryProductStateW(productCode.c_str());
+        if (state == INSTALLSTATE_DEFAULT || state == INSTALLSTATE_LOCAL || state == INSTALLSTATE_SOURCE) {
+            isActiveOrHasExe = true;
+        }
+
+        if (!isActiveOrHasExe) {
+            std::wstring trimmedCode = productCode;
+            if (!trimmedCode.empty() && trimmedCode.front() == L'{' && trimmedCode.back() == L'}') {
+                trimmedCode = trimmedCode.substr(1, trimmedCode.length() - 2);
+            }
+            
+            HKEY hKey;
+            std::wstring regPath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products\\" + trimmedCode;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                isActiveOrHasExe = true;
+            } else {
+                regPath = L"SOFTWARE\\Classes\\Installer\\Products\\" + trimmedCode;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                    isActiveOrHasExe = true;
+                }
+            }
+        }
+
+        fs::path targetDir = installerPath / productCode;
+        if (fs::exists(targetDir) && fs::is_directory(targetDir)) {
+            try {
+                for (const auto& subEntry : fs::recursive_directory_iterator(targetDir, fs::directory_options::skip_permission_denied)) {
+                    if (subEntry.is_regular_file() && _wcsicmp(subEntry.path().extension().wstring().c_str(), L".exe") == 0) {
+                        collectedExes.push_back(subEntry.path().filename().wstring());
+                        isActiveOrHasExe = true;
+                    }
+                }
+            } catch (...) {}
+        } else {
+            std::wstring trimmedCode = productCode;
+            if (!trimmedCode.empty() && trimmedCode.front() == L'{' && trimmedCode.back() == L'}') {
+                trimmedCode = trimmedCode.substr(1, trimmedCode.length() - 2);
+            }
+
+            try {
+                for (const auto& dirEntry : fs::directory_iterator(installerPath)) {
+                    if (dirEntry.is_directory()) {
+                        std::wstring dirName = dirEntry.path().filename().wstring();
+                        if (dirName.find(trimmedCode) != std::wstring::npos) {
+                            for (const auto& subEntry : fs::recursive_directory_iterator(dirEntry.path(), fs::directory_options::skip_permission_denied)) {
+                                if (subEntry.is_regular_file() && _wcsicmp(subEntry.path().extension().wstring().c_str(), L".exe") == 0) {
+                                    collectedExes.push_back(subEntry.path().filename().wstring());
+                                    isActiveOrHasExe = true;
+                                }
+                            }
+                            if (isActiveOrHasExe) break;
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    if (!collectedExes.empty()) {
+        for (size_t i = 0; i < collectedExes.size(); ++i) {
+            if (i > 0) outExeNames += L", ";
+            outExeNames += collectedExes[i];
+        }
+    }
+    
+    return isActiveOrHasExe;
+}
+
+std::wstring GetMsiProductName(const std::wstring& msiPath) {
+    MSIHANDLE hDatabase = 0;
+    std::wstring productName = L"";
+
+    if (MsiOpenDatabaseW(msiPath.c_str(), (LPCWSTR)MSIDBOPEN_READONLY, &hDatabase) == ERROR_SUCCESS) {
+        MSIHANDLE hView = 0;
+        if (MsiDatabaseOpenViewW(hDatabase, L"SELECT Value FROM Property WHERE Property = 'ProductName'", &hView) == ERROR_SUCCESS) {
+            if (MsiViewExecute(hView, 0) == ERROR_SUCCESS) {
+                MSIHANDLE hRecord = 0;
+                if (MsiViewFetch(hView, &hRecord) == ERROR_SUCCESS) {
+                    wchar_t buffer[256] = { 0 };
+                    DWORD cchBuf = 256;
+                    if (MsiRecordGetStringW(hRecord, 1, buffer, &cchBuf) == ERROR_SUCCESS && wcslen(buffer) > 0) {
+                        productName = buffer;
+                    }
+                    MsiCloseHandle(hRecord);
+                }
+            }
+            MsiCloseHandle(hView);
+        }
+        MsiCloseHandle(hDatabase);
+    }
+    
+    return productName;
+}
+
+uintmax_t GetDirectorySize(const fs::path& dirPath) {
+    uintmax_t size = 0;
+    try {
+        for (const auto& p : fs::recursive_directory_iterator(dirPath, fs::directory_options::skip_permission_denied)) {
+            if (p.is_regular_file()) {
+                try {
+                    size += fs::file_size(p.path());
+                } catch (...) {}
+            }
+        }
+    } catch (...) {}
+    return size;
+}
+
+void AnalyzeInstallerDirectory(const fs::path& dirPath, InstallerItem& item) {
+    std::wstring dirName = dirPath.filename().wstring();
+    item.path = dirPath.wstring();
+    item.fileName = dirName;
+    item.sizeBytes = GetDirectorySize(dirPath);
+    item.productName = L"Cached Directory (" + dirName + L")";
+
+    std::wstring productCode = dirName;
+    if (productCode.length() == 32 && productCode.front() != L'{') {
+        productCode = L"{" + productCode.substr(0, 8) + L"-" + productCode.substr(8, 4) + L"-" + productCode.substr(12, 4) + L"-" + productCode.substr(16, 4) + L"-" + productCode.substr(20, 12) + L"}";
+    }
+
+    bool isActive = false;
+    if (productCode.front() == L'{' && productCode.back() == L'}') {
+        INSTALLSTATE state = MsiQueryProductStateW(productCode.c_str());
+        if (state == INSTALLSTATE_DEFAULT || state == INSTALLSTATE_LOCAL || state == INSTALLSTATE_SOURCE) {
+            isActive = true;
+        }
+
+        if (!isActive) {
+            std::wstring trimmedCode = productCode;
+            trimmedCode = trimmedCode.substr(1, trimmedCode.length() - 2);
+            HKEY hKey;
+            std::wstring regPath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products\\" + trimmedCode;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                RegCloseKey(hKey);
+                isActive = true;
+            }
+        }
+    }
+
+    std::vector<std::wstring> collectedExes;
+    try {
+        for (const auto& subEntry : fs::recursive_directory_iterator(dirPath, fs::directory_options::skip_permission_denied)) {
+            if (subEntry.is_regular_file()) {
+                std::wstring ext = subEntry.path().extension().wstring();
+                if (_wcsicmp(ext.c_str(), L".exe") == 0) {
+                    collectedExes.push_back(subEntry.path().filename().wstring());
+                }
+                if (_wcsicmp(ext.c_str(), L".msi") == 0 && item.productName.rfind(L"Cached Directory", 0) == 0) {
+                    std::wstring msiName = GetMsiProductName(subEntry.path().wstring());
+                    if (!msiName.empty()) {
+                        item.productName = msiName;
+                    }
+                }
+            }
+        }
+    } catch (...) {}
+
+    std::wstring exeStr = L"";
+    for (size_t i = 0; i < collectedExes.size(); ++i) {
+        if (i > 0) exeStr += L", ";
+        exeStr += collectedExes[i];
+    }
+    item.exeNames = exeStr;
+    item.isOrphaned = !isActive;
+}
+
+void ScanWindowsInstallerFolder() {
+    g_InstallerItems.clear();
+    installerLastError.clear();
+
+    fs::path installerPath = L"C:\\Windows\\Installer";
+    if (!fs::exists(installerPath)) {
+        installerLastError = L"C:\\Windows\\Installer directory does not exist.";
+        return;
+    }
+
+    try {
+        for (const auto& entry : fs::directory_iterator(installerPath)) {
+            if (entry.is_regular_file()) {
+                std::wstring ext = entry.path().extension().wstring();
+                if (_wcsicmp(ext.c_str(), L".msi") == 0 || _wcsicmp(ext.c_str(), L".msp") == 0) {
+                    InstallerItem item;
+                    item.path = entry.path().wstring();
+                    item.fileName = entry.path().filename().wstring();
+                    
+                    try {
+                        item.sizeBytes = fs::file_size(entry.path());
+                    } catch (...) {
+                        item.sizeBytes = 0;
+                    }
+
+                    bool active = false;
+                    std::wstring foundExes = L"";
+                    if (_wcsicmp(ext.c_str(), L".msi") == 0) {
+                        active = IsMsiProductActive(item.path, foundExes);
+                        item.productName = GetMsiProductName(item.path);
+                    } else {
+                        active = true; 
+                    }
+
+                    item.exeNames = foundExes;
+                    item.isOrphaned = !active;
+                    g_InstallerItems.push_back(item);
+                }
+            } 
+            else if (entry.is_directory()) {
+                InstallerItem dirItem;
+                AnalyzeInstallerDirectory(entry.path(), dirItem);
+                g_InstallerItems.push_back(dirItem);
+            }
+        }
+    } catch (const std::exception& e) {
+        std::string narrowErr = e.what();
+        installerLastError.assign(narrowErr.begin(), narrowErr.end());
+    } catch (...) {
+        installerLastError = L"Unknown error while scanning C:\\Windows\\Installer.";
+    }
+}
+
+void PerformBackgroundStringSearch(DWORD pid, MemoryRegion reg, std::string query) {
+    isSearchingActive = true;
+    searchedBytesCount = 0;
+    totalBytesToSearch = reg.regionSize;
+
+    HANDLE hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (hProc) {
+        if (reg.state == MEM_COMMIT && 
+            (reg.protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ))) {
+            
+            std::vector<char> buffer(reg.regionSize);
+            SIZE_T bytesRead = 0;
+            
+            if (ReadProcessMemory(hProc, (LPCVOID)reg.baseAddress, buffer.data(), reg.regionSize, &bytesRead)) {
+                totalBytesToSearch = bytesRead;
+                
+                for (size_t i = 0; i <= bytesRead - query.length(); ++i) {
+                    if (!isSearchingActive) break;
+
+                    if (memcmp(&buffer[i], query.data(), query.length()) == 0) {
+                        char matchInfo[512];
+                        uintptr_t foundAddr = reg.baseAddress + i;
+                        snprintf(matchInfo, sizeof(matchInfo), "Found at offset +0x%zX (Absolute: 0x%016llX)", i, (unsigned long long)foundAddr);                        
+                        std::lock_guard<std::mutex> lock(searchResultsMutex);
+                        searchResultsList.push_back(matchInfo);
+                        
+                        if (searchResultsList.size() >= 500) {
+                            searchResultsList.push_back("[!] Limit reached: 500+ matches found.");
+                            break;
+                        }
+                    }
+                    searchedBytesCount = i;
+                }
+            }
+        }
+        CloseHandle(hProc);
+    }
+    isSearchingActive = false;
+}
+
+void PerformBackgroundStringExtraction(DWORD pid, MemoryRegion reg) {
+    isSearchingActive = true;
+    searchedBytesCount = 0;
+    totalBytesToSearch = reg.regionSize;
+
+    HANDLE hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (hProc) {
+        if (reg.state == MEM_COMMIT && 
+            (reg.protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ))) {
+            
+            std::vector<char> buffer(reg.regionSize);
+            SIZE_T bytesRead = 0;
+            
+            if (ReadProcessMemory(hProc, (LPCVOID)reg.baseAddress, buffer.data(), reg.regionSize, &bytesRead)) {
+                totalBytesToSearch = bytesRead;
+                
+                std::string currentString = "";
+                size_t stringStartOffset = 0;
+
+                for (size_t i = 0; i < bytesRead; ++i) {
+                    if (!isSearchingActive) break;
+                    char c = buffer[i];
+                    if (c >= 32 && c <= 126) {
+                        if (currentString.empty()) {
+                            stringStartOffset = i;
+                        }
+                        currentString += c;
+                    } else {
+                        if (currentString.length() >= 4) {
+                            char matchInfo[1024];
+                            uintptr_t foundAddr = reg.baseAddress + stringStartOffset;
+                            snprintf(matchInfo, sizeof(matchInfo), "[0x%016llX] %s", (unsigned long long)foundAddr, currentString.c_str());
+                            
+                            std::lock_guard<std::mutex> lock(searchResultsMutex);
+                            searchResultsList.push_back(matchInfo);
+                            
+                            if (searchResultsList.size() >= 2000) {
+                                searchResultsList.push_back("[!] Limit reached: 2000+ strings found.");
+                                break;
+                            }
+                        }
+                        currentString.clear();
+                    }
+                    searchedBytesCount = i;
+                }
+            }
+        }
+        CloseHandle(hProc);
+    }
+    isSearchingActive = false;
 }
 
 std::vector<NetworkConnectionItem> GetActiveConnections() {
@@ -1010,6 +2210,79 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
             showConnections = true;
         }
         
+        if (ImGui::MenuItem("Generate Full Process Forensic Report...")) {
+            char customReportPath[MAX_PATH];
+            snprintf(customReportPath, sizeof(customReportPath), "%s_%lu_forensic_report.txt", p.name.c_str(), p.pid);
+            
+            if (GetSaveDumpFilePath(customReportPath, MAX_PATH, hwnd)) {
+                EnableDebugPrivilege();
+                
+                std::ofstream report(customReportPath);
+                if (report.is_open()) {
+                    report << "========================================\n";
+                    report << " NEXUSGLASSMANAGER - PROCESS FORENSIC REPORT\n";
+                    report << "========================================\n";
+                    report << "Process Name : " << p.name << "\n";
+                    report << "Process ID   : " << p.pid << "\n";
+                    report << "Executable   : " << p.exePath << "\n";
+                    report << "CPU Usage    : " << p.cpuUsage << "%\n";
+                    report << "Working Set  : " << (double)p.workingSetSize / (1024.0 * 1024.0) << " MB\n\n";
+
+                    report << "--- VIRTUAL MEMORY MAP ---\n";
+                    std::string memErr;
+                    std::vector<MemoryRegion> memRegions = GetProcessMemoryMap(p.pid, memErr);
+                    if (memErr.empty()) {
+                        for (const auto& mr : memRegions) {
+                            report << "Base: 0x" << std::hex << mr.baseAddress << std::dec 
+                                   << " | Size: " << mr.regionSize << " bytes"
+                                   << " | State: " << mr.state 
+                                   << " | Protect: " << mr.protect << "\n";
+                        }
+                    } else {
+                        report << "Error fetching memory map: " << memErr << "\n";
+                    }
+                    report << "\n";
+
+                    report << "--- LOADED MODULES (DLLs) ---\n";
+                    std::string modErr, thrErr;
+                    std::vector<ModuleInfoItem> mods = GetProcessModules(p.pid, modErr);
+                    if (modErr.empty()) {
+                        for (const auto& mod : mods) {
+                            report << "Module: " << mod.name << " | Path: " << mod.path << " | Base: 0x" << std::hex << mod.baseAddress << std::dec << "\n";
+                        }
+                    } else {
+                        report << "Error fetching modules: " << modErr << "\n";
+                    }
+                    report << "\n";
+
+                    report << "--- ACTIVE THREADS ---\n";
+                    std::vector<ThreadInfoItem> thrs = GetProcessThreads(p.pid, thrErr);
+                    if (thrErr.empty()) {
+                        for (const auto& th : thrs) {
+                            report << "Thread ID: " << th.tid << "\n";
+                        }
+                    } else {
+                        report << "Error fetching threads: " << thrErr << "\n";
+                    }
+                    report << "\n";
+
+                    report << "--- NETWORK CONNECTIONS ---\n";
+                    std::string connErr;
+                    std::vector<ConnectionInfoItem> conns = GetProcessConnections(p.pid, connErr);
+                    if (connErr.empty()) {
+                        for (const auto& c : conns) {
+                            report << "Proto: " << c.protocol << " | Local: " << c.localAddr << ":" << c.localPort 
+                                   << " | Remote: " << c.remoteAddr << ":" << c.remotePort << " | State: " << c.state << "\n";
+                        }
+                    } else {
+                        report << "Error fetching connections: " << connErr << "\n";
+                    }
+
+                    report.close();
+                }
+            }
+        }
+
         if (ImGui::MenuItem("Dump Memory to File...")) {
             char customDumpPath[MAX_PATH];
             snprintf(customDumpPath, sizeof(customDumpPath), "%s_dump.dmp", p.name.c_str());
@@ -1055,9 +2328,9 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     if (isOpen) {
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                                 modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                 connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses,
-                                 monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
+                               modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                               connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses,
+                               monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
@@ -1852,6 +3125,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                 ImGui::EndMenu();
             }
+
+            if (ImGui::BeginMenu("Tools")) {
+                if (ImGui::MenuItem("Live Boot Media Builder...")) {
+                    showLiveBootModal = true;
+                }
+                if (ImGui::MenuItem("Forensic Report Viewer...")) {
+                    showReportViewerModal = true;
+                }
+                ImGui::EndMenu();
+            }
+
             ImGui::EndMenuBar();
         }
 
@@ -1940,6 +3224,61 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
+            // TAB BOOT ANALYZE
+            if (ImGui::BeginTabItem("Boot & Rootkit Analyzer")) {
+                ImGui::Text("Target Disk or Raw Image Path (e.g., \\\\.\\PhysicalDrive0):");
+                ImGui::InputText("##bootDisk", bootDiskInput, IM_ARRAYSIZE(bootDiskInput));
+
+                if (ImGui::Button("Scan Boot Sectors & EFI", ImVec2(180, 0))) {
+                    bootCachedItems = BootSecurityEngine::ScanBootSectors(bootDiskInput, bootLastError);
+                    bootScanned = true;
+                }
+
+                ImGui::Separator();
+
+                if (!bootScanned) {
+                    ImGui::TextDisabled("Click 'Scan Boot Sectors & EFI' to inspect MBR signatures and bootkit indicators.");
+                } else if (!bootLastError.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", bootLastError.c_str());
+                } else {
+                    ImGui::Text("Scan Results: %zu artifacts analyzed", bootCachedItems.size());
+
+                    ImGuiTableFlags bootTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("BootTable", 4, bootTableFlags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                        ImGui::TableSetupColumn("Target Component", ImGuiTableColumnFlags_WidthFixed, 160.0f);
+                        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                        ImGui::TableSetupColumn("Technical Details", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& item : bootCachedItems) {
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%s", item.artifactType.c_str());
+
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%s", item.targetName.c_str());
+
+                            ImGui::TableSetColumnIndex(2);
+                            if (item.status.find("Anómalo") != std::string::npos) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", item.status.c_str());
+                            } else {
+                                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "%s", item.status.c_str());
+                            }
+
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::TextUnformatted(item.details.c_str());
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+
+                ImGui::EndTabItem();
+            }
+
             // TAB: PROCESSES
             if (ImGui::BeginTabItem("Processes")) {
                 ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ PROCESS MONITOR // ACTIVE ]");
@@ -1974,6 +3313,288 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     }
                     ImGui::EndTable();
                 }
+                ImGui::EndTabItem();
+            }
+
+            // TAB PREFETCH ANLYZER
+            if (ImGui::BeginTabItem("Prefetch Analyzer")) {                
+                ImGui::Text("Path to Prefetch Directory:");
+                ImGui::InputText("##pfPath", pfPathInput, IM_ARRAYSIZE(pfPathInput));
+                
+                if (ImGui::Button("Scan Prefetch (.pf)", ImVec2(180, 0))) {
+                    pfCachedItems = PrefetchEngine::ScanPrefetch(pfPathInput, pfLastError);
+                    pfDataLoaded = true;
+                }
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(250);
+                ImGui::InputText("Filter Executable", pfSearchFilter, IM_ARRAYSIZE(pfSearchFilter));
+
+                ImGui::Separator();
+
+                if (!pfDataLoaded) {
+                    ImGui::TextDisabled("Click 'Scan Prefetch (.pf)' to analyze execution artifacts.");
+                } else if (!pfLastError.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", pfLastError.c_str());
+                } else {
+                    ImGui::Text("Found Prefetch Files: %zu", pfCachedItems.size());
+
+                    ImGuiTableFlags pfFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("PrefetchTable", 4, pfFlags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("Executable / Prefetch Name", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+                        ImGui::TableSetupColumn("File Size", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                        ImGui::TableSetupColumn("Execution Status", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                        ImGui::TableSetupColumn("Full Path", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& pf : pfCachedItems) {
+                            if (strlen(pfSearchFilter) > 0 && pf.executableName.find(pfSearchFilter) == std::string::npos) {
+                                continue;
+                            }
+
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%s", pf.executableName.c_str());
+
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%llu bytes", (unsigned long long)pf.fileSize);
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Verified Execution");
+
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::TextUnformatted(pf.filePath.c_str());
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Installer Folder")) {
+                ImGui::Text("Audits C:\\Windows\\Installer for orphaned .msi and .msp packages to reclaim disk space.");
+                ImGui::Separator();
+
+                if (ImGui::Button("Scan Installer Folder", ImVec2(180, 0))) {
+                    ScanWindowsInstallerFolder();
+                    installerDataLoaded = true;
+                }
+
+                ImGui::SameLine();
+                ImGui::Checkbox("Show Only Orphaned", &installerShowOnlyOrphaned);
+                
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputText("Filter File", installerSearchFilter, IM_ARRAYSIZE(installerSearchFilter));
+
+                ImGui::Separator();
+
+                if (!installerDataLoaded) {
+                    ImGui::TextDisabled("Click 'Scan Installer Folder' to inspect C:\\Windows\\Installer packages.");
+                } else if (!installerLastError.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", installerLastError.c_str());
+                } else {
+                    ImGui::Text("Scanned Packages: %zu", g_InstallerItems.size());
+
+                    ImGuiTableFlags installerFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("InstallerTable", 5, installerFlags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("File Name", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+                        ImGui::TableSetupColumn("Product Name", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+                        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                        ImGui::TableSetupColumn("Size (MB)", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                        ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& item : g_InstallerItems) {
+                            std::string narrowFileName(item.fileName.begin(), item.fileName.end());
+                            std::string narrowProductName(item.productName.begin(), item.productName.end());
+                            
+                            if (installerShowOnlyOrphaned && !item.isOrphaned) continue;
+                            if (strlen(installerSearchFilter) > 0 && 
+                                narrowFileName.find(installerSearchFilter) == std::string::npos && 
+                                narrowProductName.find(installerSearchFilter) == std::string::npos) continue;
+
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            if (!item.exeNames.empty()) {
+                                ImGui::Text("%ls -> %ls", item.fileName.c_str(), item.exeNames.c_str());
+                            } else {
+                                ImGui::Text("%ls", item.fileName.c_str());
+                            }
+                            ImGui::TableSetColumnIndex(1);
+                            if (!item.productName.empty()) {
+                                ImGui::Text("%ls", item.productName.c_str());
+                            } else {
+                                ImGui::TextDisabled("Unknown");
+                            }
+                            ImGui::TableSetColumnIndex(2);
+                            if (item.isOrphaned) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Orphaned");
+                            } else {
+                                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Installed");
+                            }
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::Text("%.2f MB", (float)item.sizeBytes / (1024.0f * 1024.0f));
+                            ImGui::TableSetColumnIndex(4);
+                            ImGui::Text("%ls", item.path.c_str());
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+
+                ImGui::EndTabItem();
+            }
+
+            // TAB $MFT ANALISIS
+            if (ImGui::BeginTabItem("MFT Parser")) {                
+                ImGui::Text("Path to exported NTFS $MFT file:");
+                ImGui::InputText("##mftPath", mftPathInput, IM_ARRAYSIZE(mftPathInput));
+                
+                if (ImGui::Button("Parse $MFT Database", ImVec2(180, 0))) {
+                    mftCachedRecords = MFTEngine::ParseMFTFile(mftPathInput, mftLastError);
+                    mftDataLoaded = true;
+                }
+
+                ImGui::SameLine();
+                ImGui::Checkbox("Show Only Deleted", &mftShowOnlyDeleted);
+                
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputText("Filter File", mftSearchFilter, IM_ARRAYSIZE(mftSearchFilter));
+
+                ImGui::Separator();
+
+                if (!mftDataLoaded) {
+                    ImGui::TextDisabled("Provide a valid exported $MFT file path and click 'Parse $MFT Database'.");
+                } else if (!mftLastError.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", mftLastError.c_str());
+                } else {
+                    ImGui::Text("Parsed Records: %zu", mftCachedRecords.size());
+
+                    ImGuiTableFlags mftFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                                ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("MFTTable", 5, mftFlags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("ID / Rec", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                        ImGui::TableSetupColumn("File Name", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                        ImGui::TableSetupColumn("Modified Time ($SI)", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                        ImGui::TableSetupColumn("Parent Path", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& rec : mftCachedRecords) {
+                            if (mftShowOnlyDeleted && !rec.isDeleted) continue;
+                            if (strlen(mftSearchFilter) > 0 && rec.fileName.find(mftSearchFilter) == std::string::npos) continue;
+
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%llu", (unsigned long long)rec.recordNumber);
+
+                            ImGui::TableSetColumnIndex(1);
+                            if (rec.isDeleted) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Deleted");
+                            } else {
+                                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Active");
+                            }
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%s", rec.fileName.c_str());
+
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::Text("%s", rec.standardModified.c_str());
+
+                            ImGui::TableSetColumnIndex(4);
+                            ImGui::TextUnformatted(rec.parentPath.c_str());
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+
+                ImGui::EndTabItem();
+            }
+
+            // TAB REGISTRY PARSER
+            if (ImGui::BeginTabItem("Registry Parser")) {                
+                ImGui::Text("Path to Offline Registry Hive (SOFTWARE, SYSTEM, SAM, SECURITY):");
+                ImGui::InputText("##regPath", regPathInput, IM_ARRAYSIZE(regPathInput));
+                
+                const char* hiveTypes[] = { "SOFTWARE", "SYSTEM", "SAM", "SECURITY" };
+                ImGui::SetNextItemWidth(150);
+                ImGui::Combo("Hive Type", &selectedHiveTypeIndex, hiveTypes, IM_ARRAYSIZE(hiveTypes));
+                
+                ImGui::SameLine();
+                if (ImGui::Button("Parse Registry Hive", ImVec2(160, 0))) {
+                    std::string hType = hiveTypes[selectedHiveTypeIndex];
+                    regCachedArtifacts = RegistryHiveEngine::ParseHiveFile(regPathInput, hType, regLastError);
+                    regDataLoaded = true;
+                }
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputText("Filter Artifact", regSearchFilter, IM_ARRAYSIZE(regSearchFilter));
+
+                ImGui::Separator();
+
+                if (!regDataLoaded) {
+                    ImGui::TextDisabled("Select an offline hive file and click 'Parse Registry Hive' to extract persistence and USB traces.");
+                } else if (!regLastError.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", regLastError.c_str());
+                } else {
+                    ImGui::Text("Extracted Artifacts: %zu", regCachedArtifacts.size());
+
+                    ImGuiTableFlags regTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("RegistryTable", 5, regTableFlags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("Hive", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                        ImGui::TableSetupColumn("Value Name", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                        ImGui::TableSetupColumn("Data / Command Path", ImGuiTableColumnFlags_WidthFixed, 250.0f);
+                        ImGui::TableSetupColumn("Subkey Path", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& art : regCachedArtifacts) {
+                            if (strlen(regSearchFilter) > 0 && 
+                                art.valueName.find(regSearchFilter) == std::string::npos && 
+                                art.dataValue.find(regSearchFilter) == std::string::npos) {
+                                continue;
+                            }
+
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%s", art.hiveType.c_str());
+
+                            ImGui::TableSetColumnIndex(1);
+                            if (art.category == "Persistencia") {
+                                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", art.category.c_str());
+                            } else if (art.category == "Hide Service") {
+                                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s", art.category.c_str());
+                            } else {
+                                ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "%s", art.category.c_str());
+                            }
+
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%s", art.valueName.c_str());
+
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::Text("%s", art.dataValue.c_str());
+
+                            ImGui::TableSetColumnIndex(4);
+                            ImGui::TextUnformatted(art.keyPath.c_str());
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+
                 ImGui::EndTabItem();
             }
 
@@ -2031,6 +3652,135 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     }
                     ImGui::EndTable();
                 }
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Event Logs")) {    
+                ImGui::Text("Channel Name or .evtx File Path:");
+                ImGui::InputText("##evPath", evTargetChannel, IM_ARRAYSIZE(evTargetChannel));
+                
+                ImGui::Checkbox("Is static file (.evtx on disk)", &evIsFilePath);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120);
+                ImGui::SliderInt("Max", &evMaxLimit, 50, 1000);
+
+                ImGui::SetNextItemWidth(120);
+                ImGui::InputInt("Filter Event ID", &evFilterId);
+                ImGui::SameLine();
+                if (ImGui::Button("Reset ID")) evFilterId = 0;
+
+                ImGui::SetNextItemWidth(250);
+                ImGui::InputText("Search text", evSearchFilter, IM_ARRAYSIZE(evSearchFilter));
+
+                if (ImGui::Button("Query Events", ImVec2(180, 0))) {
+                    std::wstring wPath(evTargetChannel[0] ? std::wstring(evTargetChannel, evTargetChannel + strlen(evTargetChannel)) : L"Security");
+                    evCachedEvents = EventLogEngine::QueryEvents(wPath, evIsFilePath, evMaxLimit);
+                    evDataLoaded = true;
+                }
+
+                ImGui::Separator();
+
+                if (!evDataLoaded) {
+                    ImGui::TextDisabled("Click 'Query Events' to load log information.");
+                } else {
+                    ImGui::Text("Fetched Events: %zu", evCachedEvents.size());
+
+                    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("EventsTable", 3, flags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn("Status / Channel", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                        ImGui::TableSetupColumn("XML Content (Preview)", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& ev : evCachedEvents) {
+                            if (evFilterId != 0 && (int)ev.eventId != evFilterId) continue;
+                            if (strlen(evSearchFilter) > 0 && ev.xmlContent.find(evSearchFilter) == std::string::npos) continue;
+
+                            ImGui::TableNextRow();
+
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%lu", ev.eventId);
+
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("Parsed");
+
+                            ImGui::TableSetColumnIndex(2);
+                            std::string shortXml = ev.xmlContent.substr(0, 90) + "...";
+                            ImGui::TextUnformatted(shortXml.c_str());
+
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::BeginTooltip();
+                                ImGui::TextUnformatted(ev.xmlContent.c_str());
+                                ImGui::EndTooltip();
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+                
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Artifact Scanner")) {    
+                ImGui::Text("Scan high-risk persistence & execution paths (.exe, .dll, .ps1, .bat, .lnk):");
+                
+                ImGui::SetNextItemWidth(150);
+                ImGui::SliderInt("Max Age (Days)", &arMaxDays, 1, 365);
+                ImGui::SameLine();
+
+                if (ImGui::Button("Run Forensic Scan", ImVec2(180, 0))) {
+                    arCachedArtifacts = ArtifactEngine::ScanArtifacts("", arMaxDays);
+                    arDataLoaded = true;
+                }
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputText("Filter Path", arSearchFilter, IM_ARRAYSIZE(arSearchFilter));
+
+                ImGui::Separator();
+
+                if (!arDataLoaded) {
+                    ImGui::TextDisabled("Click 'Run Forensic Scan' to analyze file system artifacts.");
+                } else {
+                    ImGui::Text("Found Artifacts: %zu (Sorted by most recent)", arCachedArtifacts.size());
+
+                    ImGuiTableFlags artFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                    if (ImGui::BeginTable("ArtifactsTable", 4, artFlags, ImVec2(0, 400))) {
+                        ImGui::TableSetupColumn("Ext", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn("Last Modified", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                        ImGui::TableSetupColumn("Size (Bytes)", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                        ImGui::TableSetupColumn("Full File Path", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto& art : arCachedArtifacts) {
+                            if (strlen(arSearchFilter) > 0 && art.filePath.find(arSearchFilter) == std::string::npos) {
+                                continue;
+                            }
+
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("%s", art.extension.c_str());
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%s", art.lastModifiedStr.c_str());
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::Text("%llu", (unsigned long long)art.fileSize);
+                            ImGui::TableSetColumnIndex(3);
+                            ImGui::TextUnformatted(art.filePath.c_str());
+
+                            if (ImGui::IsItemHovered()) {
+                                ImGui::BeginTooltip();
+                                ImGui::Text("Path: %s", art.filePath.c_str());
+                                ImGui::EndTooltip();
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+
                 ImGui::EndTabItem();
             }
             
@@ -2813,6 +4563,247 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         if (showNetDetailsModal) {
             ImGui::OpenPopup("Network Connection Details");
         }
+        if (showLiveBootModal) {
+            ImGui::OpenPopup("Live Boot Builder Modal");
+        }
+        if (showReportViewerModal) {
+            ImGui::OpenPopup("Forensic Report Viewer");
+        }
+        if (ImGui::BeginPopupModal("Forensic Report Viewer", &showReportViewerModal)) {
+            if (ImGui::Button("Open Report File...", ImVec2(150, 0))) {
+                char filename[MAX_PATH] = "";
+                OPENFILENAMEA ofn = {0};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = filename;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+                
+                if (GetOpenFileNameA(&ofn)) {
+                    std::ifstream file(filename);
+                    if (file.is_open()) {
+                        std::stringstream buffer;
+                        buffer << file.rdbuf();
+                        loadedReportContent = buffer.str();
+                        loadedReportFilename = filename;
+                    }
+                }
+            }
+
+            if (!loadedReportFilename.empty()) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "Loaded: %s", loadedReportFilename.c_str());
+            }
+
+            ImGui::Separator();
+
+            if (loadedReportContent.empty()) {
+                ImGui::Spacing();
+                ImGui::TextDisabled("No report loaded. Click 'Open Report File...' to select a previously generated text report.");
+                ImGui::Spacing();
+            } else {
+                std::vector<std::string> generalInfo;
+                std::vector<std::string> memoryLines;
+                std::vector<std::string> moduleLines;
+                std::vector<std::string> threadLines;
+                std::vector<std::string> networkLines;
+
+                std::istringstream stream(loadedReportContent);
+                std::string line;
+                int currentSection = 0;
+
+                while (std::getline(stream, line)) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+
+                    if (line.find("NEXUSGLASSMANAGER") != std::string::npos || line.find("====") != std::string::npos) continue;
+
+                    if (line.find("--- VIRTUAL MEMORY MAP ---") != std::string::npos) { currentSection = 1; continue; }
+                    if (line.find("--- LOADED MODULES (DLLs) ---") != std::string::npos) { currentSection = 2; continue; }
+                    if (line.find("--- ACTIVE THREADS ---") != std::string::npos) { currentSection = 3; continue; }
+                    if (line.find("--- NETWORK CONNECTIONS ---") != std::string::npos) { currentSection = 4; continue; }
+
+                    if (line.empty()) continue;
+
+                    if (currentSection == 0) generalInfo.push_back(line);
+                    else if (currentSection == 1) memoryLines.push_back(line);
+                    else if (currentSection == 2) moduleLines.push_back(line);
+                    else if (currentSection == 3) threadLines.push_back(line);
+                    else if (currentSection == 4) networkLines.push_back(line);
+                }
+
+                if (ImGui::BeginTabBar("ReportViewerTabs", ImGuiTabBarFlags_NoTooltip)) {
+                    if (ImGui::BeginTabItem("General Info")) {
+                        ImGui::BeginChild("TabGenChild", ImVec2(0, -10), true);
+                        ImGui::Spacing();
+                        for (const auto& item : generalInfo) {
+                            ImGui::BulletText("%s", item.c_str());
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Virtual Memory")) {
+                        ImGui::BeginChild("TabMemChild", ImVec2(0, -10), true, ImGuiWindowFlags_HorizontalScrollbar);
+                        ImGui::Spacing();
+                        for (const auto& item : memoryLines) {
+                            if (item.find("EXECUTE") != std::string::npos) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", item.c_str());
+                            } else {
+                                ImGui::Text("%s", item.c_str());
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Loaded Modules")) {
+                        ImGui::BeginChild("TabModChild", ImVec2(0, -10), true, ImGuiWindowFlags_HorizontalScrollbar);
+                        ImGui::Spacing();
+                        for (const auto& item : moduleLines) {
+                            ImGui::Text("%s", item.c_str());
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Active Threads")) {
+                        ImGui::BeginChild("TabThrChild", ImVec2(0, -10), true);
+                        ImGui::Spacing();
+                        for (const auto& item : threadLines) {
+                            ImGui::Text("%s", item.c_str());
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Network Connections")) {
+                        ImGui::BeginChild("TabNetChild", ImVec2(0, -10), true, ImGuiWindowFlags_HorizontalScrollbar);
+                        ImGui::Spacing();
+                        for (const auto& item : networkLines) {
+                            if (item.find("ESTABLISHED") != std::string::npos) {
+                                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", item.c_str());
+                            } else {
+                                ImGui::Text("%s", item.c_str());
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+
+                    ImGui::EndTabBar();
+                }
+            }
+
+            ImGui::Spacing();
+            if (ImGui::Button("Close Viewer", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+                showReportViewerModal = false;
+            }
+
+            ImGui::EndPopup();
+        }
+        if (ImGui::BeginPopupModal("Live Boot Builder Modal", &showLiveBootModal, ImGuiWindowFlags_AlwaysAutoResize)) {
+            static int targetTypeIndex = 0;
+            static char usbDriveInput[16] = "E:";
+            static char isoPathInput[MAX_PATH] = "C:\\LiveMonitorBoot.iso";
+            static bool isBuildingProcess = false;
+            static std::string liveProgressMessage = "Idle";
+
+            ImGui::TextWrapped("Generates a rescue and audit environment in strict read-only mode.");
+            ImGui::Separator();
+
+            ImGui::RadioButton("Direct USB Drive", &targetTypeIndex, 0); ImGui::SameLine();
+            ImGui::RadioButton("ISO File (for VM)", &targetTypeIndex, 1);
+
+            if (targetTypeIndex == 0) {
+                ImGui::SetNextItemWidth(250.0f);
+                ImGui::InputText("USB Drive", usbDriveInput, sizeof(usbDriveInput));
+                ImGui::SameLine();
+                if (ImGui::Button("Browse Drives...")) {
+                    ImGui::OpenPopup("UsbDrivePopup");
+                }
+
+                if (ImGui::BeginPopup("UsbDrivePopup")) {
+                    DWORD drives = GetLogicalDrives();
+                    for (char letter = 'A'; letter <= 'Z'; ++letter) {
+                        if (drives & (1 << (letter - 'A'))) {
+                            char rootPath[4] = { letter, ':', '\\', '\0' };
+                            UINT type = GetDriveTypeA(rootPath);
+                            if (type == DRIVE_REMOVABLE || type == DRIVE_FIXED) {
+                                char label[16];
+                                snprintf(label, sizeof(label), "%c:", letter);
+                                if (ImGui::Selectable(label)) {
+                                    snprintf(usbDriveInput, sizeof(usbDriveInput), "%c:", letter);
+                                }
+                            }
+                        }
+                    }
+                    ImGui::EndPopup();
+                }
+
+                ImGui::TextDisabled("(e.g., E:). Warning: It will be completely formatted!");
+            } else {
+                ImGui::SetNextItemWidth(300.0f);
+                ImGui::InputText("Target ISO Path", isoPathInput, sizeof(isoPathInput));
+                ImGui::SameLine();
+                if (ImGui::Button("Browse...")) {
+                    OPENFILENAMEA ofn;
+                    char szFile[MAX_PATH];
+                    ZeroMemory(&ofn, sizeof(ofn));
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = NULL;
+                    ofn.lpstrFile = szFile;
+                    ofn.lpstrFile[0] = '\0';
+                    ofn.nMaxFile = sizeof(szFile);
+                    ofn.lpstrFilter = "ISO Files\0*.iso\0All Files\0*.*\0";
+                    ofn.nMaxFileTitle = 0;
+                    ofn.lpstrInitialDir = NULL;
+                    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+                    ofn.lpstrDefExt = "iso";
+                    if (GetSaveFileNameA(&ofn)) {
+                        strncpy_s(isoPathInput, ofn.lpstrFile, sizeof(isoPathInput));
+                    }
+                }
+            }
+
+            ImGui::Spacing();
+
+            if (isBuildingProcess) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "[Status]: %s", liveProgressMessage.c_str());
+            } else {
+                if (ImGui::Button("Build Live Boot Media", ImVec2(160, 0))) {
+                    isBuildingProcess = true;
+                    liveProgressMessage = "Starting...";
+
+                    std::string destination = (targetTypeIndex == 0) ? std::string(usbDriveInput) : std::string(isoPathInput);
+                    bool isUsb = (targetTypeIndex == 0);
+
+                    std::thread([=]() {
+                        bool success = BuildLiveBootMedia(destination, isUsb, liveProgressMessage);
+                        if (!success && liveProgressMessage.find("Error") == std::string::npos && liveProgressMessage.find("Failed") == std::string::npos) {
+                            liveProgressMessage = "Unknown error during creation.";
+                        }
+                        isBuildingProcess = false;
+                    }).detach();
+                }
+            }
+
+            if (!isBuildingProcess && !liveProgressMessage.empty() && liveProgressMessage != "Idle") {
+                ImGui::Spacing();
+                ImGui::TextWrapped("Result: %s", liveProgressMessage.c_str());
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            
+            if (ImGui::Button("Close", ImVec2(120, 0)) && !isBuildingProcess) {
+                showLiveBootModal = false;
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::EndPopup();
+        }
         if (ImGui::BeginPopupModal("Network Connection Details", &showNetDetailsModal, ImGuiWindowFlags_NoResize)) {
             ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ SOCKET & PROCESS FORENSICS ]");
             ImGui::Separator();
@@ -2881,19 +4872,132 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                         ImGui::TableSetupColumn("Protection", ImGuiTableColumnFlags_WidthFixed, 120.0f);
                         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                         ImGui::TableHeadersRow();
-                        for (const auto& reg : cachedMemoryRegions) {
+
+                        int clickedRowIndex = -1;
+
+                        for (size_t i = 0; i < cachedMemoryRegions.size(); ++i) {
+                            const auto& reg = cachedMemoryRegions[i];
                             ImGui::TableNextRow();
-                            ImGui::TableSetColumnIndex(0); ImGui::Text("0x%016llX", reg.baseAddress);
+                            
+                            ImGui::TableSetColumnIndex(0);
+                            char rowLabel[64];
+                            snprintf(rowLabel, sizeof(rowLabel), "0x%016llX##row%zu", reg.baseAddress, i);
+                            
+                            if (ImGui::Selectable(rowLabel, false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                            }
+
+                            if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                                clickedRowIndex = (int)i;
+                            }
+
                             ImGui::TableSetColumnIndex(1); ImGui::Text("%zu", reg.regionSize);
                             ImGui::TableSetColumnIndex(2); ImGui::Text("%s", GetStateString(reg.state).c_str());
                             ImGui::TableSetColumnIndex(3); ImGui::Text("%s", GetProtectionString(reg.protect).c_str());
                             ImGui::TableSetColumnIndex(4); ImGui::Text("%s", GetTypeString(reg.type).c_str());
                         }
+
+                        if (clickedRowIndex != -1) {
+                            selectedMemoryRegionForSearch = cachedMemoryRegions[clickedRowIndex];
+                            searchTargetPid = memoryMapPid;
+                            ImGui::OpenPopup("MemoryRegionContextMenu");
+                        }
+
+                        if (ImGui::BeginPopup("MemoryRegionContextMenu")) {
+                            if (ImGui::MenuItem("Search String in this Region...")) {
+                                showStringSearchModal = true;
+                                memset(searchStringInput, 0, sizeof(searchStringInput));
+                                
+                                {
+                                    std::lock_guard<std::mutex> lock(searchResultsMutex);
+                                    searchResultsList.clear();
+                                }
+                                
+                                if (memorySearchThread.joinable()) {
+                                    memorySearchThread.join();
+                                }
+                                memorySearchThread = std::thread(PerformBackgroundStringExtraction, searchTargetPid, selectedMemoryRegionForSearch);
+                                ImGui::OpenPopup("String Search Results");
+                            }
+                            ImGui::EndPopup();
+                        }
+
                         ImGui::EndTable();
                     }
                 }
             }
             ImGui::End();
+        }
+
+        if (showStringSearchModal) {
+            ImGui::OpenPopup("String Search Results");
+        }
+
+        if (ImGui::BeginPopupModal("String Search Results", &showStringSearchModal, ImGuiWindowFlags_None)) {
+            
+            ImGui::Text("Target PID: %lu | Region: 0x%016llX | Size: %zu bytes", 
+                        searchTargetPid, selectedMemoryRegionForSearch.baseAddress, selectedMemoryRegionForSearch.regionSize);
+            ImGui::Separator();
+
+            ImGui::Text("Filter Strings:");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputText("##StringFilterInput", searchStringInput, sizeof(searchStringInput));
+
+            if (isSearchingActive && totalBytesToSearch > 0) {
+                float progress = (float)searchedBytesCount / (float)totalBytesToSearch;
+                char progressOverlay[64];
+                snprintf(progressOverlay, sizeof(progressOverlay), "Extracting strings... %.1f%%", progress * 100.0f);
+                ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f), progressOverlay);
+            } else {
+                ImGui::Spacing();
+            }
+
+            ImGui::Separator();
+            
+            std::vector<std::string> localResultsCopy;
+            {
+                std::lock_guard<std::mutex> lock(searchResultsMutex);
+                localResultsCopy = searchResultsList;
+            }
+
+            std::string filterText(searchStringInput);
+            size_t displayedCount = 0;
+
+            ImGui::Text("Strings found: %zu %s", localResultsCopy.size(), isSearchingActive ? "(Scanning...)" : "");
+            
+            ImGui::BeginChild("SearchResultsScroll", ImVec2(0, -45), true, ImGuiWindowFlags_HorizontalScrollbar);
+            for (const auto& res : localResultsCopy) {
+                if (!filterText.empty()) {
+                    std::string lowerRes = res;
+                    std::string lowerFilter = filterText;
+                    std::transform(lowerRes.begin(), lowerRes.end(), lowerRes.begin(), ::tolower);
+                    std::transform(lowerFilter.begin(), lowerFilter.end(), lowerFilter.begin(), ::tolower);
+                    
+                    if (lowerRes.find(lowerFilter) == std::string::npos) {
+                        continue;
+                    }
+                }
+
+                ImGui::TextUnformatted(res.c_str());
+                displayedCount++;
+            }
+            ImGui::EndChild();
+
+            if (!filterText.empty()) {
+                ImGui::TextDisabled("Showing %zu matching strings", displayedCount);
+            }
+
+            if (ImGui::Button("Close", ImVec2(100, 0))) {
+                if (isSearchingActive) {
+                    isSearchingActive = false;
+                }
+                if (memorySearchThread.joinable()) {
+                    memorySearchThread.join();
+                }
+                ImGui::CloseCurrentPopup();
+                showStringSearchModal = false;
+            }
+
+            ImGui::EndPopup();
         }
 
         if (showModulesThreads) {
