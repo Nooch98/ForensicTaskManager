@@ -1,6 +1,6 @@
 # Forensic Task Manager
 
-> **⚠️ Learning Project Disclaimer:** This project is built as a hands-on exercise to deepen my practical understanding of C++, the Win32 API, graphics rendering, and UI design patterns. Because I am actively learning, the codebase may contain bugs, inefficient algorithms, suboptimal patterns, or memory management flaws. Constructive feedback, code reviews, and issue reports are more than welcome!
+> **⚠️ Learning Project & Architectural Disclaimer:** This project is built as a hands-on exercise to deepen my practical understanding of C++, the Win32 API, graphics rendering, and UI design patterns. Because I am actively learning, the codebase embraces a **monolithic structure** with minimal early-stage optimization, featuring massive source files, basic linear execution paths, and trade-offs prioritizing feature delivery over architectural purity. Constructive feedback, code reviews, and issue reports are more than welcome!
 
 ## Technical Overview & Architecture
 
@@ -99,7 +99,7 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
       <sub><b>Artifact Scanner</b><br/><i>Automated System Artifacts & Indicators of Compromise</i></sub>
     </td>
     <td align="center" width="50%">
-      <img width="1918" height="1048" src="https://github.com/user-attachments/assets/cda864c8-dc90-4431-b89c-cd9e967be69e" alt="Installer Folder Analyzer" /><br/>
+      <img width="1918" height="1048" src="https://github.com/user-attachments/assets/de7d97bf-be91-4a22-9afd-a34d696cd3c4" alt="Installer Folder Analyzer" /><br/>
       <sub><b>Windows Installer Analyzer</b><br/><i>Cached Package Audit & Registry Cross-Referencing</i></sub>
     </td>
   </tr>
@@ -140,4 +140,3 @@ To avoid manual configuration or heavy IDE setups, you can use the provided auto
     ```bash
     .\build.ps1
     ```
-<img width="1918" height="1048" alt="Captura de pantalla 2026-09-10 172259" src="https://github.com/user-attachments/assets/de7d97bf-be91-4a22-9afd-a34d696cd3c4" />
