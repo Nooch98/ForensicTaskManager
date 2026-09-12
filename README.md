@@ -17,6 +17,8 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 * **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
 * **Advanced Process Inspector & Forensics:**
   * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents.
+  
+  https://github.com/user-attachments/assets/665ccd5b-ba0f-4dc0-b842-5028e8f9eebb
   * **Memory Injection & Anomaly Detection:** Scans process memory space for indicators of compromise, such as unbacked executable regions, anomalous protection states, or cross-process handles indicative of DLL/shellcode injection.
   * **Handles & Advanced DLLs Inspector:** Asynchronous background extraction of process handles via native NT APIs alongside deep module validation.
   * **Virtual Memory Map & String Search:** Enumerates memory regions, states, protections, types (`VirtualQueryEx`), and supports real-time background string extraction and filtering across memory sections.
@@ -107,6 +109,8 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
     </td>
   </tr>
 </table>
+
+
 
 ## Known Areas for Improvement (Learning In Progress)
 
