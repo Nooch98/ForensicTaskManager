@@ -8,14 +8,17 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 
 * **UI Framework:** [Dear ImGui](https://github.com/ocornut/imgui) (Docking branch enabled) utilizing a custom skinning layer to achieve a dynamic Glassmorphism aesthetic.
 * **Graphics Backend:** OpenGL 3.0+ initialized directly through the Win32 window context (`wglCreateContext`).
-* **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, etc.) to extract process data, memory maps, threads, modules, and network connections.
-* **Data Caching Pattern:** To mitigate UI stuttering caused by heavy blocking Win32 calls (such as `CreateToolhelp32Snapshot`), data is fetched and updated via a timed caching loop (`refreshTimer`) rather than every single frame.
+* **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, native NT APIs like `NtQuerySystemInformation`, etc.) to extract process data, memory maps, threads, modules, and network connections.
+* **Data Caching & Asynchronous Fetching:** Heavy diagnostic and blocking operations (such as system-wide handle enumeration and module parsing) are offloaded to background worker threads (`std::thread`) with selective safe-type object name resolution, ensuring zero UI stuttering or freezes during complex process analysis.
 
 ## Core Features
 
 * **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
 * **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
 * **Advanced Process Inspector & Forensics:**
+  * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents.
+  * **Memory Injection & Anomaly Detection:** Scans process memory space for indicators of compromise, such as unbacked executable regions, anomalous protection states, or cross-process handles indicative of DLL/shellcode injection.
+  * **Handles & Advanced DLLs Inspector:** Asynchronous background extraction of process handles via native NT APIs alongside deep module validation.
   * **Virtual Memory Map & String Search:** Enumerates memory regions, states, protections, types (`VirtualQueryEx`), and supports real-time background string extraction and filtering across memory sections.
   * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
   * **Process Control & Incident Response:** Supports termination, command-line arguments inspection, and **Process Suspension (`NtSuspendProcess`)** to freeze malicious activities or ransomware in real-time.
