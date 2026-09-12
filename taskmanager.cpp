@@ -47,6 +47,59 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_opengl3.h"
 
+#ifndef _UNICODE_STRING_DEFINED
+#define _UNICODE_STRING_DEFINED
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+#endif
+
+#ifndef SystemHandleInformation
+#define SystemHandleInformation ((SYSTEM_INFORMATION_CLASS)64)
+#endif
+
+typedef enum _OBJECT_INFORMATION_CLASS {
+    ObjectBasicInformation = 0,
+    ObjectNameInformation = 1,
+    ObjectTypeInformation = 2,
+    ObjectAllInformation = 3,
+    ObjectDataInformation = 4
+} OBJECT_INFORMATION_CLASS;
+
+typedef NTSTATUS(WINAPI* PFN_NT_QUERY_SYSTEM_INFORMATION)(
+    ULONG SystemInformationClass,
+    PVOID SystemInformation,
+    ULONG SystemInformationLength,
+    PULONG ReturnLength
+);
+
+typedef NTSTATUS(WINAPI* PFN_NT_QUERY_OBJECT)(
+    HANDLE Handle,
+    OBJECT_INFORMATION_CLASS ObjectInformationClass,
+    PVOID ObjectInformation,
+    ULONG ObjectInformationLength,
+    PULONG ReturnLength
+);
+
+struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
+    PVOID Object;
+    HANDLE UniqueProcessId;
+    HANDLE HandleValue;
+    ULONG GrantedAccess;
+    USHORT CreatorBackTraceIndex;
+    USHORT ObjectTypeIndex;
+    ULONG HandleAttributes;
+    ULONG Reserved;
+};
+
+struct SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG_PTR NumberOfHandles;
+    ULONG_PTR Reserved;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+};
+
 struct ProcessTimeData {
     ULARGE_INTEGER lastKernel;
     ULARGE_INTEGER lastUser;
@@ -60,6 +113,8 @@ struct ProcessInfo {
     std::string exePath;
     SIZE_T workingSetSize;
     float cpuUsage;
+    bool isParentSpoofed = false;
+    std::string spoofingReason = "";
     std::vector<ProcessInfo> children;
 };
 
@@ -69,6 +124,7 @@ struct MemoryRegion {
     DWORD state;
     DWORD protect;
     DWORD type;
+    bool isSuspicious = false;
 };
 
 struct ModuleInfoItem {
@@ -211,6 +267,7 @@ struct LiveMemoryRegion {
     std::string state;
     std::string protection;
     std::string type;
+    bool isSuspicious = false;
 };
 
 struct ForensicEvent {
@@ -254,6 +311,20 @@ struct BootArtifactItem {
     std::string targetName;
     std::string status;
     std::string details;
+};
+
+struct HandleItem {
+    void* handleValue;
+    std::string typeName;
+    std::string objectName;
+};
+
+struct AdvancedModuleItem {
+    std::string name;
+    uintptr_t baseAddress;
+    std::string path;
+    bool isModified;
+    bool isHijackedPath;
 };
 
 namespace fs = std::filesystem;
@@ -405,6 +476,16 @@ bool installerDataLoaded = false;
 bool installerShowOnlyOrphaned = false;
 char installerSearchFilter[256] = { 0 };
 std::wstring installerLastError = L"";
+
+// Handles And Dll Modal
+bool showRegistryBrowserModal = false;
+bool isHandlesDllsLoading = false;
+DWORD handlesDllsPid = 0;
+bool showHandlesDlls = false;
+std::vector<HandleItem> cachedHandles;
+std::string handlesError;
+std::vector<AdvancedModuleItem> cachedAdvancedModules;
+std::string advancedModulesError;
 
 static NetworkConnectionItem selectedNetConn;
 bool EnableDebugPrivilege();
@@ -1678,12 +1759,19 @@ std::vector<LiveMemoryRegion> GetProcessMemoryMap(HANDLE hProcess, std::string& 
             default:          reg.state = "Unknown"; break;
         }
 
+        bool isExecutable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+
         if (mbi.State == MEM_COMMIT) {
             DWORD prot = mbi.Protect & 0xFF;
-            if (prot == PAGE_EXECUTE_READWRITE) reg.protection = "ERW (Dangerous)";
-            else if (prot == PAGE_EXECUTE_READ)  reg.protection = "ER";
+            if (prot == PAGE_EXECUTE_READWRITE) {
+                reg.protection = "ERW (Dangerous)";
+            }
+            else if (prot == PAGE_EXECUTE_READ) {
+                reg.protection = "ER";
+            }
             else if (prot == PAGE_READWRITE)     reg.protection = "RW";
             else if (prot == PAGE_READONLY)      reg.protection = "R";
+            else if (isExecutable)               reg.protection = "Exec (Other)";
             else                                 reg.protection = "Other";
         } else {
             reg.protection = "-";
@@ -1695,6 +1783,8 @@ std::vector<LiveMemoryRegion> GetProcessMemoryMap(HANDLE hProcess, std::string& 
             case MEM_PRIVATE: reg.type = "Private"; break;
             default:          reg.type = "-"; break;
         }
+
+        reg.isSuspicious = (mbi.State == MEM_COMMIT && mbi.Type != MEM_IMAGE && isExecutable);
 
         regions.push_back(reg);
 
@@ -2028,6 +2118,8 @@ std::vector<ProcessInfo> GetRunningProcesses() {
 
     ULONGLONG currentTick = GetTickCount64();
     std::unordered_map<DWORD, bool> activePids;
+    std::unordered_map<DWORD, std::string> pidToPathMap;
+    std::unordered_map<DWORD, std::string> pidToNameMap;
 
     if (Process32First(hSnap, &pe)) {
         do {
@@ -2077,10 +2169,37 @@ std::vector<ProcessInfo> GetRunningProcesses() {
                 }
                 CloseHandle(hProcess);
             }
+
+            pidToPathMap[info.pid] = info.exePath;
+            pidToNameMap[info.pid] = info.name;
             flatProcesses.push_back(info);
         } while (Process32Next(hSnap, &pe));
     }
     CloseHandle(hSnap);
+
+    for (auto& info : flatProcesses) {
+        std::string lowerName = info.name;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+
+        if (lowerName == "lsass.exe" || lowerName == "csrss.exe" || lowerName == "services.exe" || lowerName == "wininit.exe") {
+            if (info.exePath != "N/A" && info.exePath.find("System32") == std::string::npos) {
+                info.isParentSpoofed = true;
+                info.spoofingReason = "Critical System Binary outside System32";
+            }
+        }
+
+        if (pidToNameMap.find(info.parentPid) != pidToNameMap.end()) {
+            std::string parentName = pidToNameMap[info.parentPid];
+            std::transform(parentName.begin(), parentName.end(), parentName.begin(), ::tolower);
+
+            if (info.exePath != "N/A" && (info.exePath.find("Temp") != std::string::npos || info.exePath.find("AppData") != std::string::npos)) {
+                if (parentName == "services.exe" || parentName == "wininit.exe" || parentName == "lsass.exe") {
+                    info.isParentSpoofed = true;
+                    info.spoofingReason = "User-space executable spawned by Core System Parent";
+                }
+            }
+        }
+    }
 
     for (auto it = g_ProcessHistory.begin(); it != g_ProcessHistory.end();) {
         if (activePids.find(it->first) == activePids.end()) it = g_ProcessHistory.erase(it);
@@ -2100,7 +2219,6 @@ std::vector<ProcessInfo> GetRunningProcesses() {
     }
 
     std::unordered_set<DWORD> visitedPids;
-
     std::function<ProcessInfo(DWORD)> buildNode = [&](DWORD pid) -> ProcessInfo {
         visitedPids.insert(pid);
         ProcessInfo node = processMap[pid];
@@ -2139,11 +2257,196 @@ std::vector<ProcessInfo> GetRunningProcesses() {
     return rootProcesses;
 }
 
+std::vector<HandleItem> GetProcessHandles(DWORD pid, std::string& errorStr) {
+    std::vector<HandleItem> items;
+    errorStr.clear();
+
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (!hNtdll) {
+        errorStr = "Failed to load ntdll.dll";
+        return items;
+    }
+
+    auto NtQuerySystemInformation = (PFN_NT_QUERY_SYSTEM_INFORMATION)GetProcAddress(hNtdll, "NtQuerySystemInformation");
+    auto NtQueryObject = (PFN_NT_QUERY_OBJECT)GetProcAddress(hNtdll, "NtQueryObject");
+
+    if (!NtQuerySystemInformation || !NtQueryObject) {
+        errorStr = "Failed to resolve native NT APIs";
+        return items;
+    }
+
+    ULONG bufferSize = 1024 * 1024 * 4;
+    PVOID buffer = malloc(bufferSize);
+    if (!buffer) {
+        errorStr = "Out of memory for handle query";
+        return items;
+    }
+
+    ULONG returnLength = 0;
+    NTSTATUS status = NtQuerySystemInformation(64, buffer, bufferSize, &returnLength);
+    
+    if (status == (NTSTATUS)0xC0000004L) {
+        free(buffer);
+        bufferSize = returnLength + (1024 * 64);
+        buffer = malloc(bufferSize);
+        if (!buffer) {
+            errorStr = "Out of memory (resized buffer)";
+            return items;
+        }
+        status = NtQuerySystemInformation(64, buffer, bufferSize, &returnLength);
+    }
+
+    if (status < 0) {
+        free(buffer);
+        errorStr = "NtQuerySystemInformation failed with status: 0x" + std::to_string(status);
+        return items;
+    }
+
+    HANDLE hTargetProc = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hTargetProc) {
+        free(buffer);
+        errorStr = "Failed to open target process (Access Denied / Invalid PID)";
+        return items;
+    }
+
+    auto sysHandles = (SYSTEM_HANDLE_INFORMATION_EX*)buffer;
+    for (ULONG_PTR i = 0; i < sysHandles->NumberOfHandles; ++i) {
+        auto& entry = sysHandles->Handles[i];
+        if ((DWORD)(uintptr_t)entry.UniqueProcessId != pid) continue;
+
+        HANDLE duplicatedHandle = nullptr;
+        if (!DuplicateHandle(hTargetProc, entry.HandleValue, GetCurrentProcess(), &duplicatedHandle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            continue;
+        }
+
+        HandleItem item;
+        item.handleValue = entry.HandleValue;
+
+        WCHAR typeBuffer[256] = {0};
+        ULONG retLen = 0;
+        if (NtQueryObject(duplicatedHandle, ObjectTypeInformation, typeBuffer, sizeof(typeBuffer), &retLen) >= 0) {
+            UNICODE_STRING* objType = (UNICODE_STRING*)typeBuffer;
+            if (objType && objType->Buffer) {
+                int len = WideCharToMultiByte(CP_UTF8, 0, objType->Buffer, objType->Length / sizeof(WCHAR), nullptr, 0, nullptr, nullptr);
+                if (len > 0) {
+                    std::string tName(len, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, objType->Buffer, objType->Length / sizeof(WCHAR), &tName[0], len, nullptr, nullptr);
+                    item.typeName = tName;
+                }
+            }
+        }
+
+        if (item.typeName.empty()) item.typeName = "Unknown";
+        item.objectName = "-";
+
+        if (item.typeName == "File" || item.typeName == "Directory" || item.typeName == "Key") {
+            WCHAR nameBuffer[1024] = {0};
+            if (NtQueryObject(duplicatedHandle, ObjectNameInformation, nameBuffer, sizeof(nameBuffer), &retLen) >= 0) {
+                UNICODE_STRING* objName = (UNICODE_STRING*)nameBuffer;
+                if (objName && objName->Buffer && objName->Length > 0) {
+                    int len = WideCharToMultiByte(CP_UTF8, 0, objName->Buffer, objName->Length / sizeof(WCHAR), nullptr, 0, nullptr, nullptr);
+                    if (len > 0) {
+                        std::string oName(len, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, objName->Buffer, objName->Length / sizeof(WCHAR), &oName[0], len, nullptr, nullptr);
+                        item.objectName = oName;
+                    }
+                }
+            }
+        }
+
+        items.push_back(item);
+        CloseHandle(duplicatedHandle);
+    }
+
+    CloseHandle(hTargetProc);
+    free(buffer);
+    return items;
+}
+
+std::vector<AdvancedModuleItem> GetAdvancedProcessModules(DWORD pid, std::string& errorStr) {
+    std::vector<AdvancedModuleItem> items;
+    errorStr.clear();
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        errorStr = "Failed to create module snapshot for PID " + std::to_string(pid);
+        return items;
+    }
+
+    MODULEENTRY32W me32;
+    me32.dwSize = sizeof(MODULEENTRY32W);
+
+    if (Module32FirstW(hSnapshot, &me32)) {
+        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        
+        do {
+            AdvancedModuleItem mod;
+            
+            int nameLen = WideCharToMultiByte(CP_UTF8, 0, me32.szModule, -1, nullptr, 0, nullptr, nullptr);
+            std::string modName(nameLen > 0 ? nameLen : 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, me32.szModule, -1, &modName[0], nameLen, nullptr, nullptr);
+            if (!modName.empty() && modName.back() == '\0') modName.pop_back();
+            mod.name = modName;
+
+            int pathLen = WideCharToMultiByte(CP_UTF8, 0, me32.szExePath, -1, nullptr, 0, nullptr, nullptr);
+            std::string modPath(pathLen > 0 ? pathLen : 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, me32.szExePath, -1, &modPath[0], pathLen, nullptr, nullptr);
+            if (!modPath.empty() && modPath.back() == '\0') modPath.pop_back();
+            mod.path = modPath;
+
+            mod.baseAddress = (uintptr_t)me32.modBaseAddr;
+            mod.isModified = false;
+            mod.isHijackedPath = false;
+
+            if (hProcess) {
+                IMAGE_DOS_HEADER dosHeader;
+                if (ReadProcessMemory(hProcess, me32.modBaseAddr, &dosHeader, sizeof(dosHeader), nullptr)) {
+                    if (dosHeader.e_magic == IMAGE_DOS_SIGNATURE) {
+                        IMAGE_NT_HEADERS ntHeaders;
+                        if (ReadProcessMemory(hProcess, me32.modBaseAddr + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders), nullptr)) {
+                            HANDLE hFile = CreateFileW(me32.szExePath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                            if (hFile != INVALID_HANDLE_VALUE) {
+                                HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
+                                if (hMapping) {
+                                    LPVOID pMappedFile = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+                                    if (pMappedFile) {
+                                        PIMAGE_NT_HEADERS diskNt = ImageNtHeader(pMappedFile);
+                                        if (diskNt) {
+                                            if (diskNt->OptionalHeader.AddressOfEntryPoint != ntHeaders.OptionalHeader.AddressOfEntryPoint) {
+                                                mod.isModified = true;
+                                            }
+                                        }
+                                        UnmapViewOfFile(pMappedFile);
+                                    }
+                                    CloseHandle(hMapping);
+                                }
+                                CloseHandle(hFile);
+                            }
+                        }
+                    }
+                }
+            }
+
+            items.push_back(mod);
+        } while (Module32NextW(hSnapshot, &me32));
+
+        if (hProcess) CloseHandle(hProcess);
+    } else {
+        errorStr = "Failed to enumerate modules via Toolhelp32";
+    }
+
+    CloseHandle(hSnapshot);
+    return items;
+}
+
 void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DWORD& selectedPid, HWND hwnd,
                         DWORD& memoryMapPid, bool& showMemoryMap, std::vector<MemoryRegion>& cachedMemoryRegions, std::string& memoryMapError,
                         DWORD& modThreadsPid, bool& showModulesThreads, std::vector<ModuleInfoItem>& cachedModules, std::string& modulesError,
                         std::vector<ThreadInfoItem>& cachedThreads, std::string& threadsError, DWORD& connectionsPid, bool& showConnections,
-                        std::vector<ConnectionInfoItem>& cachedConnections, std::string& connectionsError, std::vector<ProcessInfo>& cachedProcesses,
+                        std::vector<ConnectionInfoItem>& cachedConnections, std::string& connectionsError, 
+                        DWORD& handlesDllsPid, bool& showHandlesDlls, std::vector<HandleItem>& cachedHandles, std::string& handlesError,
+                        std::vector<AdvancedModuleItem>& cachedAdvancedModules, std::string& advancedModulesError, bool& isHandlesDllsLoading,
+                        std::vector<ProcessInfo>& cachedProcesses,
                         DWORD& monitoredPidRef, HANDLE& hMonitoredProcessRef, bool& isTrackingRef, 
                         float* liveCpuHist, float* liveMemHist, int& liveHistIndex, ULONGLONG& lastLiveTickRef) {
     
@@ -2208,6 +2511,36 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
             connectionsPid = selectedPid;
             cachedConnections = GetProcessConnections(connectionsPid, connectionsError);
             showConnections = true;
+        }
+        if (ImGui::MenuItem("View Handles & Advanced DLLs Inspector")) {
+            handlesDllsPid = selectedPid;
+            cachedHandles.clear();
+            cachedAdvancedModules.clear();
+            handlesError.clear();
+            advancedModulesError.clear();
+            isHandlesDllsLoading = true;
+            showHandlesDlls = true;
+
+            std::thread([pid = handlesDllsPid, 
+                         &cachedHandles, 
+                         &cachedAdvancedModules, 
+                         &handlesError, 
+                         &advancedModulesError, 
+                         &isHandlesDllsLoading]() {
+                
+                OutputDebugStringA("Iniciando carga de Handles...\n");
+                std::string errH, errM;
+                auto handles = GetProcessHandles(pid, errH);
+                OutputDebugStringA("Handles terminados. Iniciando Advanced Modules...\n");
+                auto modules = GetAdvancedProcessModules(pid, errM);
+                OutputDebugStringA("Advanced Modules terminados.\n");
+
+                cachedHandles = std::move(handles);
+                cachedAdvancedModules = std::move(modules);
+                handlesError = std::move(errH);
+                advancedModulesError = std::move(errM);
+                isHandlesDllsLoading = false;
+            }).detach();
         }
         
         if (ImGui::MenuItem("Generate Full Process Forensic Report...")) {
@@ -2319,18 +2652,32 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         }
         ImGui::EndPopup();
     }
-
-    ImGui::TableSetColumnIndex(1); ImGui::Text("%lu", p.pid);
-    ImGui::TableSetColumnIndex(2); ImGui::Text("%.1f%%", p.cpuUsage);
-    ImGui::TableSetColumnIndex(3); ImGui::Text("%.1f MB", (double)p.workingSetSize / (1024.0 * 1024.0));
-    ImGui::TableSetColumnIndex(4); ImGui::Text("%s", p.exePath.c_str());
+    ImGui::TableSetColumnIndex(1); 
+    ImGui::Text("%lu", p.pid);
+    ImGui::TableSetColumnIndex(2); 
+    ImGui::Text("%.1f%%", p.cpuUsage);
+    ImGui::TableSetColumnIndex(3); 
+    ImGui::Text("%.1f MB", (double)p.workingSetSize / (1024.0 * 1024.0));
+    ImGui::TableSetColumnIndex(4);
+    if (p.isParentSpoofed) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "[!] SPOOFED");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Parent Spoofing / Anomaly detected:\n%s", p.spoofingReason.c_str());
+        }
+    } else {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "OK");
+    }
+    ImGui::TableSetColumnIndex(5); 
+    ImGui::Text("%s", p.exePath.c_str());
 
     if (isOpen) {
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                               modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                               connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses,
-                               monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
+                                    modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                                    connectionsPid, showConnections, cachedConnections, connectionsError,
+                                    handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                                    cachedProcesses,
+                                    monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
@@ -3294,11 +3641,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::Spacing();
                 float tableHeight = (float)winHeight - 190.0f;
 
-                if (ImGui::BeginTable("ProcessTable", 5, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
+                if (ImGui::BeginTable("ProcessTable", 6, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
                     ImGui::TableSetupColumn("NAME", ImGuiTableColumnFlags_WidthStretch, 2.0f);
                     ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("CPU (%)", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("MEMORY (MB)", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableSetupColumn("STATUS / SPOOFING", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                     ImGui::TableSetupColumn("PATH", ImGuiTableColumnFlags_WidthStretch, 3.0f);
                     ImGui::TableHeadersRow();
 
@@ -3307,9 +3655,12 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                     for (const auto& p : cachedProcesses) {
                         RenderProcessTreeRow(p, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                                            modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                            connectionsPid, showConnections, cachedConnections, connectionsError, cachedProcesses,
-                                            monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick);
+                            modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                            connectionsPid, showConnections, cachedConnections, connectionsError,
+                            handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                            cachedProcesses,
+                            monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick
+                            );
                     }
                     ImGui::EndTable();
                 }
@@ -4569,6 +4920,95 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         if (showReportViewerModal) {
             ImGui::OpenPopup("Forensic Report Viewer");
         }
+        if (showHandlesDlls) {
+            ImGui::OpenPopup("Handles & Advanced DLLs Inspector");
+        }
+        if (ImGui::BeginPopupModal("Handles & Advanced DLLs Inspector", &showHandlesDlls)) {
+            ImGui::Text("Inspecting Process ID: %lu", handlesDllsPid);
+            ImGui::Separator();
+
+            if (isHandlesDllsLoading) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Loading system handles and auditing DLLs in background...");
+                ImGui::Spacing();
+            } else {
+                if (ImGui::BeginTabBar("HandlesDllsTabs")) {            
+                    // SYSTEM HANDLES TAB
+                    if (ImGui::BeginTabItem("System Handles")) {
+                        if (!handlesError.empty()) {
+                            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Error: %s", handlesError.c_str());
+                        } else if (cachedHandles.empty()) {
+                            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "No handles retrieved. The target process may have exited, or access was restricted.");
+                        } else {
+                            if (ImGui::BeginTable("HandlesTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 360))) {
+                                ImGui::TableSetupColumn("Handle Value", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                                ImGui::TableSetupColumn("Object Type", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                                ImGui::TableSetupColumn("Object Name / Details", ImGuiTableColumnFlags_WidthStretch);
+                                ImGui::TableHeadersRow();
+
+                                for (const auto& h : cachedHandles) {
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0); ImGui::Text("0x%p", h.handleValue);
+                                    ImGui::TableSetColumnIndex(1); ImGui::Text("%s", h.typeName.c_str());
+                                    ImGui::TableSetColumnIndex(2); ImGui::Text("%s", h.objectName.c_str());
+                                }
+                                ImGui::EndTable();
+                            }
+                        }
+                        ImGui::EndTabItem();
+                    }
+
+                    // ADVANCED DLL AUDIT TAB
+                    if (ImGui::BeginTabItem("Advanced DLL Audit")) {
+                        if (!advancedModulesError.empty()) {
+                            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Error: %s", advancedModulesError.c_str());
+                        } else if (cachedAdvancedModules.empty()) {
+                            ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "No modules retrieved. Ensure the target process is accessible and running.");
+                        } else {
+                            ImGui::TextWrapped("Compares physical memory-mapped DLLs against disk images to detect potential injection, hollowing, or DLL hijacking techniques.");
+                            ImGui::Spacing();
+
+                            if (ImGui::BeginTable("AdvancedDllsTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 310))) {
+                                ImGui::TableSetupColumn("Module Name", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                                ImGui::TableSetupColumn("Base Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                                ImGui::TableSetupColumn("Path on Disk", ImGuiTableColumnFlags_WidthStretch);
+                                ImGui::TableSetupColumn("Integrity / Status", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                                ImGui::TableHeadersRow();
+
+                                for (const auto& mod : cachedAdvancedModules) {
+                                    ImGui::TableNextRow();
+                                    ImGui::TableSetColumnIndex(0); ImGui::Text("%s", mod.name.c_str());
+                                    ImGui::TableSetColumnIndex(1); ImGui::Text("0x%p", (void*)mod.baseAddress);
+                                    ImGui::TableSetColumnIndex(2); ImGui::Text("%s", mod.path.c_str());
+                                    
+                                    ImGui::TableSetColumnIndex(3);
+                                    if (mod.isModified) {
+                                        ImGui::TextColored(ImVec4(1, 0.2f, 0.2f, 1), "MODIFIED (Injected)");
+                                    } else if (mod.isHijackedPath) {
+                                        ImGui::TextColored(ImVec4(1, 0.8f, 0.2f, 1), "Suspicious Path");
+                                    } else {
+                                        ImGui::TextColored(ImVec4(0.2f, 1, 0.2f, 1), "Clean / Valid");
+                                    }
+                                }
+                                ImGui::EndTable();
+                            }
+                        }
+                        ImGui::EndTabItem();
+                    }
+
+                    ImGui::EndTabBar();
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            if (ImGui::Button("Close", ImVec2(120, 0))) {
+                ImGui::CloseCurrentPopup();
+                showHandlesDlls = false;
+            }
+
+            ImGui::EndPopup();
+        }
         if (ImGui::BeginPopupModal("Forensic Report Viewer", &showReportViewerModal)) {
             if (ImGui::Button("Open Report File...", ImVec2(150, 0))) {
                 char filename[MAX_PATH] = "";
@@ -4860,13 +5300,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
 
         if (showMemoryMap) {
-            ImGui::SetNextWindowSize(ImVec2(750, 450), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(750, 520), ImGuiCond_FirstUseEver);
             if (ImGui::Begin("Virtual Memory Map", &showMemoryMap)) {
                 if (!memoryMapError.empty()) {
                     ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", memoryMapError.c_str());
                 } else {
-                    if (ImGui::BeginTable("MemoryMapTable", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 380))) {
-                        ImGui::TableSetupColumn("Base Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "[*] Scanning memory regions for injection and hollowing heuristics...");
+                    ImGui::Spacing();
+
+                    if (ImGui::BeginTable("MemoryMapTable", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 310))) {
+                        ImGui::TableSetupColumn("Base Address", ImGuiTableColumnFlags_WidthFixed, 180.0f);
                         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                         ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                         ImGui::TableSetupColumn("Protection", ImGuiTableColumnFlags_WidthFixed, 120.0f);
@@ -4878,11 +5321,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                         for (size_t i = 0; i < cachedMemoryRegions.size(); ++i) {
                             const auto& reg = cachedMemoryRegions[i];
                             ImGui::TableNextRow();
-                            
+
                             ImGui::TableSetColumnIndex(0);
-                            char rowLabel[64];
+                            char rowLabel[128];
                             snprintf(rowLabel, sizeof(rowLabel), "0x%016llX##row%zu", reg.baseAddress, i);
-                            
+
                             if (ImGui::Selectable(rowLabel, false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
                             }
 
@@ -4923,6 +5366,30 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                         ImGui::EndTable();
                     }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    ImGui::Text("Security Diagnostics & Anomalies:");
+                    ImGui::BeginChild("SuspiciousRegionsChild", ImVec2(0, 90), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+                    
+                    bool foundAnySuspicious = false;
+                    for (size_t i = 0; i < cachedMemoryRegions.size(); ++i) {
+                        const auto& reg = cachedMemoryRegions[i];
+                        if (reg.isSuspicious) {
+                            foundAnySuspicious = true;
+                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), 
+                                "[!] INJECTION DETECTED -> Address: 0x%016llX | Size: %zu bytes | Protection: %s", 
+                                reg.baseAddress, reg.regionSize, GetProtectionString(reg.protect).c_str());
+                        }
+                    }
+
+                    if (!foundAnySuspicious) {
+                        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "[+] No anomalous private executable memory regions found.");
+                    }
+                    
+                    ImGui::EndChild();
                 }
             }
             ImGui::End();
