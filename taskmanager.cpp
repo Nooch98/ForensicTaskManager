@@ -2177,14 +2177,39 @@ std::vector<ProcessInfo> GetRunningProcesses() {
     }
     CloseHandle(hSnap);
 
+    static const std::unordered_set<std::string> criticalSystemBinaries = {
+        "lsass.exe", "csrss.exe", "services.exe", "wininit.exe", 
+        "smss.exe", "winlogon.exe", "explorer.exe", "spoolsv.exe", 
+        "dwm.exe", "taskhostw.exe", "runtimebroker.exe", "svchost.exe"
+    };
+
     for (auto& info : flatProcesses) {
         std::string lowerName = info.name;
         std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
 
-        if (lowerName == "lsass.exe" || lowerName == "csrss.exe" || lowerName == "services.exe" || lowerName == "wininit.exe") {
-            if (info.exePath != "N/A" && info.exePath.find("System32") == std::string::npos) {
-                info.isParentSpoofed = true;
-                info.spoofingReason = "Critical System Binary outside System32";
+        std::string lowerPath = info.exePath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
+
+        if (criticalSystemBinaries.find(lowerName) != criticalSystemBinaries.end()) {
+            if (info.exePath != "N/A") {
+                bool isValidPath = false;
+
+                if (lowerName == "explorer.exe") {
+                    if (lowerPath.find("\\windows\\explorer.exe") != std::string::npos) {
+                        isValidPath = true;
+                    }
+                } 
+                else {
+                    if (lowerPath.find("system32") != std::string::npos || 
+                        lowerPath.find("syswow64") != std::string::npos) {
+                        isValidPath = true;
+                    }
+                }
+
+                if (!isValidPath) {
+                    info.isParentSpoofed = true;
+                    info.spoofingReason = "Critical System Binary outside authorized system directories";
+                }
             }
         }
 
@@ -2192,10 +2217,16 @@ std::vector<ProcessInfo> GetRunningProcesses() {
             std::string parentName = pidToNameMap[info.parentPid];
             std::transform(parentName.begin(), parentName.end(), parentName.begin(), ::tolower);
 
-            if (info.exePath != "N/A" && (info.exePath.find("Temp") != std::string::npos || info.exePath.find("AppData") != std::string::npos)) {
-                if (parentName == "services.exe" || parentName == "wininit.exe" || parentName == "lsass.exe") {
+            bool isSuspiciousPath = (lowerPath.find("temp") != std::string::npos || 
+                                     lowerPath.find("appdata") != std::string::npos ||
+                                     lowerPath.find("users\\public") != std::string::npos ||
+                                     lowerPath.find("downloads") != std::string::npos);
+
+            if (info.exePath != "N/A" && isSuspiciousPath) {
+                if (parentName == "services.exe" || parentName == "wininit.exe" || 
+                    parentName == "lsass.exe" || parentName == "csrss.exe" || parentName == "smss.exe") {
                     info.isParentSpoofed = true;
-                    info.spoofingReason = "User-space executable spawned by Core System Parent";
+                    info.spoofingReason = "User-space/Suspicious executable spawned by Core System Parent";
                 }
             }
         }
