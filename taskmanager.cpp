@@ -33,6 +33,10 @@
 #include <iostream>
 #include <msi.h>
 #include <msiquery.h>
+#include <evntrace.h>
+#include <evntcons.h>
+#include <queue>
+#include <set>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "Ws2_32.lib")
@@ -42,6 +46,7 @@
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "wevtapi.lib")
 #pragma comment(lib, "msi.lib")
+#pragma comment(lib, "tdh.lib")
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -98,6 +103,26 @@ struct SYSTEM_HANDLE_INFORMATION_EX {
     ULONG_PTR NumberOfHandles;
     ULONG_PTR Reserved;
     SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+};
+
+enum class TimelineEventType {
+    ProcessCreate,
+    ProcessTerminate,
+    NetworkConnection,
+    DriverLoad,
+    RegistryAction,
+    FileCreate,
+    Alert
+};
+
+struct GlobalTimelineEvent {
+    std::chrono::system_clock::time_point timestamp;
+    std::string timeString; 
+    TimelineEventType type;
+    DWORD pid;
+    std::string sourceProcess; 
+    std::string description;   
+    ImVec4 displayColor;       
 };
 
 struct ProcessTimeData {
@@ -327,6 +352,13 @@ struct AdvancedModuleItem {
     bool isHijackedPath;
 };
 
+struct EtwProcessEvent {
+    enum Type { Created, Terminated } type;
+    DWORD pid;
+    DWORD parentPid;
+    std::string imagePath;
+};
+
 namespace fs = std::filesystem;
 
 struct ForensicArtifact {
@@ -486,6 +518,12 @@ std::vector<HandleItem> cachedHandles;
 std::string handlesError;
 std::vector<AdvancedModuleItem> cachedAdvancedModules;
 std::string advancedModulesError;
+
+// ETW LIVE MONITOR
+bool etwSessionRunning = false;
+bool etwAutoScroll = true;
+char etwSearchFilter[256] = "";
+std::vector<EtwProcessEvent> etwEventLog;
 
 static NetworkConnectionItem selectedNetConn;
 bool EnableDebugPrivilege();
@@ -1008,6 +1046,76 @@ public:
     }
 };
 
+class ThreadSafeEtwQueue {
+    std::mutex m_mutex;
+    std::queue<EtwProcessEvent> m_queue;
+public:
+    void Push(const EtwProcessEvent& event) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_queue.push(event);
+    }
+
+    std::vector<EtwProcessEvent> Drain() {
+        std::vector<EtwProcessEvent> batch;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        while (!m_queue.empty()) {
+            batch.push_back(std::move(m_queue.front()));
+            m_queue.pop();
+        }
+        return batch;
+    }
+};
+inline ThreadSafeEtwQueue g_EtwEventQueue;
+
+inline std::string GetTimelineTypeName(TimelineEventType type) {
+    switch (type) {
+        case TimelineEventType::ProcessCreate:    return "Proc Created";
+        case TimelineEventType::ProcessTerminate: return "Proc Terminated";
+        case TimelineEventType::NetworkConnection:return "Network Out";
+        case TimelineEventType::DriverLoad:       return "Driver Load";
+        case TimelineEventType::RegistryAction:   return "Registry";
+        case TimelineEventType::FileCreate:       return "File Create";
+        case TimelineEventType::Alert:            return "SECURITY ALERT";
+        default: return "Unknown";
+    }
+}
+
+inline std::string GetCurrentSystemTimeString() {
+    auto now = std::chrono::system_clock::now();
+    auto in_time_t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    
+    std::tm bt;
+    localtime_s(&bt, &in_time_t);
+
+    std::ostringstream ss;
+    ss << std::put_time(&bt, "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    return ss.str();
+}
+
+template<typename T>
+class ThreadSafeQueue {
+private:
+    std::queue<T> queue;
+    std::mutex mutex;
+public:
+    void Push(const T& item) {
+        std::lock_guard<std::mutex> lock(mutex);
+        queue.push(item);
+    }
+    std::vector<T> Drain() {
+        std::vector<T> drainedItems;
+        std::lock_guard<std::mutex> lock(mutex);
+        while (!queue.empty()) {
+            drainedItems.push_back(queue.front());
+            queue.pop();
+        }
+        return drainedItems;
+    }
+};
+ThreadSafeQueue<GlobalTimelineEvent> g_GlobalTimelineQueue;
+std::vector<GlobalTimelineEvent> g_GlobalTimelineLog;
+
 bool EnableDebugPrivilege() {
     HANDLE hToken = NULL;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
@@ -1405,6 +1513,179 @@ bool IsMsiProductActive(const std::wstring& msiPath, std::wstring& outExeNames) 
     
     return isActiveOrHasExe;
 }
+static const GUID FileIoGuid = { 0x90cbdc39, 0x4a3e, 0x11d1, { 0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3 } };
+VOID WINAPI EventRecordCallback(PEVENT_RECORD pEventRecord) {
+    BYTE* userData = (BYTE*)pEventRecord->UserData;
+    if (!userData) return;
+    if (IsEqualGUID(pEventRecord->EventHeader.ProviderId, FileIoGuid)) {
+        DWORD filePid = pEventRecord->EventHeader.ProcessId;
+        if (filePid <= 4 || filePid == 0xFFFFFFFF) return;
+        std::wstring wFilePath;
+        try {
+            wchar_t* pFileName = (wchar_t*)(userData + 24); 
+            if (pFileName && wcslen(pFileName) > 3) {
+                wFilePath = pFileName;
+            }
+        } catch (...) {
+            wFilePath = L"";
+        }
+
+        if (wFilePath.empty() || wFilePath.find(L"\\") == std::string::npos) return;
+
+        int sz = WideCharToMultiByte(CP_UTF8, 0, wFilePath.c_str(), -1, NULL, 0, NULL, NULL);
+        std::string filePath = "";
+        if (sz > 0) {
+            filePath.resize(sz - 1);
+            WideCharToMultiByte(CP_UTF8, 0, wFilePath.c_str(), -1, &filePath[0], sz, NULL, NULL);
+        }
+
+        std::string lowerPath = filePath;
+        for (auto& c : lowerPath) c = (char)tolower(c);
+
+        bool isExecutable = (lowerPath.rfind(".exe") != std::string::npos) ||
+                            (lowerPath.rfind(".dll") != std::string::npos) ||
+                            (lowerPath.rfind(".bat") != std::string::npos) ||
+                            (lowerPath.rfind(".ps1") != std::string::npos);
+
+        if (!isExecutable) return;
+
+        GlobalTimelineEvent fileEv;
+        fileEv.timestamp = std::chrono::system_clock::now();
+        fileEv.timeString = GetCurrentSystemTimeString();
+        fileEv.type = TimelineEventType::FileCreate;
+        fileEv.pid = filePid;
+        fileEv.sourceProcess = "PID: " + std::to_string(filePid);
+        fileEv.description = "File created/modified: " + filePath;
+        fileEv.displayColor = ImVec4(1.0f, 0.6f, 0.2f, 1.0f);
+        g_GlobalTimelineQueue.Push(fileEv);
+        return;
+    }
+
+    USHORT opcode = pEventRecord->EventHeader.EventDescriptor.Opcode;
+    EtwProcessEvent event;
+    bool is64Bit = (pEventRecord->EventHeader.Flags & EVENT_HEADER_FLAG_64_BIT_HEADER) != 0;
+
+    if (opcode == 1 || opcode == 3) {
+        event.type = EtwProcessEvent::Created;
+        if (is64Bit) {
+            DWORD64* ptrs = (DWORD64*)userData;
+            event.pid = (DWORD)ptrs[1];
+            event.parentPid = (DWORD)ptrs[2];
+        } else {
+            DWORD32* ptrs = (DWORD32*)userData;
+            event.pid = ptrs[1];
+            event.parentPid = ptrs[2];
+        }
+
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, event.pid);
+        if (hProcess) {
+            wchar_t pathBuf[MAX_PATH] = {0};
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProcess, 0, pathBuf, &size)) {
+                int sz = WideCharToMultiByte(CP_UTF8, 0, pathBuf, -1, NULL, 0, NULL, NULL);
+                if (sz > 0) {
+                    std::string str(sz - 1, '\0');
+                    WideCharToMultiByte(CP_UTF8, 0, pathBuf, -1, &str[0], sz, NULL, NULL);
+                    event.imagePath = str;
+                }
+            }
+            CloseHandle(hProcess);
+        }
+
+        g_EtwEventQueue.Push(event);
+
+        GlobalTimelineEvent timeEv;
+        timeEv.timestamp = std::chrono::system_clock::now();
+        timeEv.timeString = GetCurrentSystemTimeString();
+        timeEv.type = TimelineEventType::ProcessCreate;
+        timeEv.pid = event.pid;
+        timeEv.sourceProcess = event.imagePath.empty() ? "Unknown Process" : event.imagePath;
+        timeEv.description = "Process executed (Parent PID: " + std::to_string(event.parentPid) + ")";
+        timeEv.displayColor = ImVec4(0.3f, 1.0f, 0.3f, 1.0f);
+        g_GlobalTimelineQueue.Push(timeEv);
+    }
+    else if (opcode == 2 || opcode == 4) {
+        event.type = EtwProcessEvent::Terminated;
+        if (is64Bit) {
+            DWORD64* ptrs = (DWORD64*)userData;
+            event.pid = (DWORD)ptrs[1];
+        } else {
+            DWORD32* ptrs = (DWORD32*)userData;
+            event.pid = ptrs[1];
+        }
+        event.parentPid = 0;
+        event.imagePath = "Process Terminated (PID: " + std::to_string(event.pid) + ")";
+        
+        g_EtwEventQueue.Push(event);
+
+        GlobalTimelineEvent timeEv;
+        timeEv.timestamp = std::chrono::system_clock::now();
+        timeEv.timeString = GetCurrentSystemTimeString();
+        timeEv.type = TimelineEventType::ProcessTerminate;
+        timeEv.pid = event.pid;
+        timeEv.sourceProcess = "PID: " + std::to_string(event.pid);
+        timeEv.description = "Process completed";
+        timeEv.displayColor = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        g_GlobalTimelineQueue.Push(timeEv);
+    }
+}
+
+void StartEtwSessionThread() {
+    std::thread([]() {
+        ULONG bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(KERNEL_LOGGER_NAMEW) + 1) * sizeof(WCHAR);
+        auto* pSessionProperties = (EVENT_TRACE_PROPERTIES*)malloc(bufferSize);
+        if (!pSessionProperties) return;
+
+        ZeroMemory(pSessionProperties, bufferSize);
+        pSessionProperties->Wnode.BufferSize = bufferSize;
+        pSessionProperties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        pSessionProperties->Wnode.Guid = SystemTraceControlGuid;
+        pSessionProperties->BufferSize = 64;
+        pSessionProperties->MinimumBuffers = 4;
+        pSessionProperties->MaximumBuffers = 16;
+        pSessionProperties->EnableFlags = EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_FILE_IO | EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_DISK_FILE_IO;
+        pSessionProperties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        pSessionProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+
+        wcscpy_s((LPWSTR)((char*)pSessionProperties + pSessionProperties->LoggerNameOffset), 
+                 wcslen(KERNEL_LOGGER_NAMEW) + 1, KERNEL_LOGGER_NAMEW);
+
+        ControlTraceW(0, KERNEL_LOGGER_NAMEW, pSessionProperties, EVENT_TRACE_CONTROL_STOP);
+
+        ZeroMemory(pSessionProperties, bufferSize);
+        pSessionProperties->Wnode.BufferSize = bufferSize;
+        pSessionProperties->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        pSessionProperties->Wnode.Guid = SystemTraceControlGuid;
+        pSessionProperties->BufferSize = 64;
+        pSessionProperties->MinimumBuffers = 4;
+        pSessionProperties->MaximumBuffers = 16;
+        pSessionProperties->EnableFlags = EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_FILE_IO | EVENT_TRACE_FLAG_FILE_IO_INIT | EVENT_TRACE_FLAG_DISK_FILE_IO;
+        pSessionProperties->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        pSessionProperties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        wcscpy_s((LPWSTR)((char*)pSessionProperties + pSessionProperties->LoggerNameOffset), 
+                 wcslen(KERNEL_LOGGER_NAMEW) + 1, KERNEL_LOGGER_NAMEW);
+
+        TRACEHANDLE sessionHandle = 0;
+        ULONG status = StartTraceW(&sessionHandle, KERNEL_LOGGER_NAMEW, pSessionProperties);
+        if (status != ERROR_SUCCESS) {
+            free(pSessionProperties);
+            return;
+        }
+
+        EVENT_TRACE_LOGFILEW logFile = { 0 };
+        logFile.LoggerName = (LPWSTR)KERNEL_LOGGER_NAMEW;
+        logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logFile.EventRecordCallback = (PEVENT_RECORD_CALLBACK)(EventRecordCallback);
+
+        TRACEHANDLE traceHandle = OpenTraceW(&logFile);
+        if (traceHandle != (TRACEHANDLE)INVALID_HANDLE_VALUE) {
+            ProcessTrace(&traceHandle, 1, NULL, NULL);
+            CloseTrace(traceHandle);
+        }
+
+        free(pSessionProperties);
+    }).detach();
+}
 
 std::wstring GetMsiProductName(const std::wstring& msiPath) {
     MSIHANDLE hDatabase = 0;
@@ -1654,6 +1935,9 @@ std::vector<NetworkConnectionItem> GetActiveConnections() {
     PMIB_TCPTABLE2 tcpTable = NULL;
     DWORD dwSize = 0;
     
+    static std::set<std::string> loggedConnections;
+    std::set<std::string> currentPollConnections;
+
     if (GetTcpTable2(NULL, &dwSize, TRUE) == ERROR_INSUFFICIENT_BUFFER) {
         tcpTable = (PMIB_TCPTABLE2)malloc(dwSize);
         if (tcpTable && GetTcpTable2(tcpTable, &dwSize, TRUE) == NO_ERROR) {
@@ -1686,11 +1970,41 @@ std::vector<NetworkConnectionItem> GetActiveConnections() {
                 }
 
                 item.processName = "PID: " + std::to_string(item.pid);
-
                 connections.push_back(item);
+
+                if (row.dwState == MIB_TCP_STATE_ESTAB) {
+                    std::string connKey = std::to_string(item.pid) + "_" + 
+                                          item.localIp + ":" + std::to_string(item.localPort) + "_" + 
+                                          item.remoteIp + ":" + std::to_string(item.remotePort);
+                    
+                    currentPollConnections.insert(connKey);
+
+                    if (loggedConnections.find(connKey) == loggedConnections.end()) {
+                        GlobalTimelineEvent timeEv;
+                        timeEv.timestamp = std::chrono::system_clock::now();
+                        timeEv.timeString = GetCurrentSystemTimeString();
+                        timeEv.type = TimelineEventType::NetworkConnection;
+                        timeEv.pid = item.pid;
+                        timeEv.sourceProcess = item.processName;
+                        timeEv.description = "Nueva conexión TCP: " + item.localIp + ":" + std::to_string(item.localPort) + 
+                                             " -> " + item.remoteIp + ":" + std::to_string(item.remotePort);
+                        timeEv.displayColor = ImVec4(0.2f, 0.8f, 1.0f, 1.0f);
+                        
+                        g_GlobalTimelineQueue.Push(timeEv);
+                        loggedConnections.insert(connKey);
+                    }
+                }
             }
         }
         if (tcpTable) free(tcpTable);
+    }
+
+    for (auto it = loggedConnections.begin(); it != loggedConnections.end(); ) {
+        if (currentPollConnections.find(*it) == currentPollConnections.end()) {
+            it = loggedConnections.erase(it);
+        } else {
+            ++it;
+        }
     }
     
     return connections;
@@ -3330,6 +3644,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = className;
     RegisterClassExW(&wc);
+    bool timelineAutoScroll = true;
+    char timelineSearchFilter[128] = { 0 };
 
     HWND hwnd = CreateWindowExW(0, className, L"Forensic Task Manager", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 1200, 800, NULL, NULL, hInstance, NULL);
 
@@ -3468,6 +3784,22 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
             graphTimer = 0.0f;
         }
+
+        auto newEvents = g_EtwEventQueue.Drain();
+        for (const auto& ev : newEvents) {
+            etwEventLog.push_back(ev);
+            if (etwEventLog.size() > 5000) {
+                etwEventLog.erase(etwEventLog.begin());
+            }
+        }
+
+        auto newTimelineEvents = g_GlobalTimelineQueue.Drain();
+        for (const auto& ev : newTimelineEvents) {
+            g_GlobalTimelineLog.push_back(ev);
+            if (g_GlobalTimelineLog.size() > 5000) {
+                g_GlobalTimelineLog.erase(g_GlobalTimelineLog.begin());
+            }
+        }
         
         ApplyGlassmorphismTheme(g_GlassAlpha, themes[currentThemeIndex].accentColor, themes[currentThemeIndex].backgroundColor);
         ImGui_ImplOpenGL3_NewFrame();
@@ -3602,6 +3934,64 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
+            // TAB SYSTEM TIMELINE
+            if (ImGui::BeginTabItem("System Timeline")) {
+                if (ImGui::Button("Clear Timeline")) {
+                    g_GlobalTimelineLog.clear();
+                }
+                ImGui::SameLine();
+                ImGui::Checkbox("Auto-scroll", &timelineAutoScroll);
+                
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(250);
+                ImGui::InputText("Filter Timeline", timelineSearchFilter, IM_ARRAYSIZE(timelineSearchFilter));
+
+                ImGui::Separator();
+
+                ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                if (ImGui::BeginTable("TimelineTable", 5, flags, ImVec2(0, 500))) {
+                    ImGui::TableSetupColumn("Timestamp", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                    ImGui::TableSetupColumn("Actor / Process", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                    ImGui::TableSetupColumn("Action Description / Details", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableHeadersRow();
+
+                    for (const auto& ev : g_GlobalTimelineLog) {
+                        if (strlen(timelineSearchFilter) > 0) {
+                            std::string searchable = ev.timeString + " " + ev.description + " " + ev.sourceProcess;
+                            if (searchable.find(timelineSearchFilter) == std::string::npos) continue;
+                        }
+
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(ev.timeString.c_str());
+                        
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextColored(ev.displayColor, "%s", GetTimelineTypeName(ev.type).c_str());
+                        
+                        ImGui::TableSetColumnIndex(2);
+                        if (ev.pid > 0) ImGui::Text("%lu", ev.pid);
+                        else ImGui::Text("-");
+                        
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(ev.sourceProcess.c_str());
+                        
+                        ImGui::TableSetColumnIndex(4);
+                        ImGui::TextUnformatted(ev.description.c_str());
+                    }
+
+                    if (timelineAutoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 20.0f) {
+                        ImGui::SetScrollHereY(1.0f);
+                    }
+
+                    ImGui::EndTable();
+                }
+                ImGui::EndTabItem();
+            }
+
             // TAB BOOT ANALYZE
             if (ImGui::BeginTabItem("Boot & Rootkit Analyzer")) {
                 ImGui::Text("Target Disk or Raw Image Path (e.g., \\\\.\\PhysicalDrive0):");
@@ -3695,6 +4085,78 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     }
                     ImGui::EndTable();
                 }
+                ImGui::EndTabItem();
+            }
+            
+            // TAB KERNEL MONITOR
+            if (ImGui::BeginTabItem("ETW Live Monitor")) {
+                if (ImGui::Button(etwSessionRunning ? "Stop ETW Session" : "Start ETW Session", ImVec2(150, 0))) {
+                    etwSessionRunning = !etwSessionRunning;
+                    if (etwSessionRunning) {
+                        StartEtwSessionThread();
+                    }
+                }
+
+                ImGui::SameLine();
+                if (ImGui::Button("Clear Logs", ImVec2(100, 0))) {
+                    etwEventLog.clear();
+                }
+
+                ImGui::SameLine();
+                ImGui::Checkbox("Auto-scroll", &etwAutoScroll);
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(200);
+                ImGui::InputText("Filter", etwSearchFilter, IM_ARRAYSIZE(etwSearchFilter));
+
+                ImGui::Separator();
+
+                ImGui::Text("Captured Events in Buffer: %zu", etwEventLog.size());
+
+                ImGuiTableFlags etwFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | 
+                                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                if (ImGui::BeginTable("EtwTable", 4, etwFlags, ImVec2(0, 400))) {
+                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                    ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                    ImGui::TableSetupColumn("Parent PID", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                    ImGui::TableSetupColumn("Event Path / Info", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableHeadersRow();
+
+                    for (const auto& rec : etwEventLog) {
+                        std::string typeStr = (rec.type == EtwProcessEvent::Created) ? "Created" : "Terminated";
+                        
+                        if (strlen(etwSearchFilter) > 0) {
+                            std::string searchable = typeStr + " " + std::to_string(rec.pid) + " " + rec.imagePath;
+                            if (searchable.find(etwSearchFilter) == std::string::npos) continue;
+                        }
+
+                        ImGui::TableNextRow();
+
+                        ImGui::TableSetColumnIndex(0);
+                        if (rec.type == EtwProcessEvent::Created) {
+                            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Created");
+                        } else {
+                            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Terminated");
+                        }
+
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("%lu", rec.pid);
+
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("%lu", rec.parentPid);
+
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(rec.imagePath.c_str());
+                    }
+
+                    if (etwAutoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+                        ImGui::SetScrollHereY(1.0f);
+                    }
+
+                    ImGui::EndTable();
+                }
+
                 ImGui::EndTabItem();
             }
 
