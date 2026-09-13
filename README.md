@@ -15,6 +15,9 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 
 * **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
 * **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
+* **ETW Kernel Telemetry & Real-Time Monitoring:**
+  * **ETW Live Monitor:** Utilizes live kernel event tracing to track process creation, termination, and detect suspicious process behavior in real time.
+  * **System Timeline:** A unified chronological dashboard providing granular visibility into system events, detailing process execution hours, network connections, and kernel-level file creation/modification tracking with customizable filters and auto-scroll support.
 * **Advanced Process Inspector & Forensics:**
   * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents.
   
