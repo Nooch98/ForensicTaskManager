@@ -386,6 +386,12 @@ struct InstallerItem {
     bool isOrphaned = true;
 };
 
+struct RegistrySnapshotItem {
+    std::string path;
+    std::string valueName;
+    std::string dataValue;
+};
+
 std::vector<InstallerItem> g_InstallerItems;
 bool g_IsScanningInstaller = false;
 static std::unordered_map<DWORD, ProcessTimeData> g_ProcessHistory;
@@ -525,6 +531,19 @@ bool etwAutoScroll = true;
 char etwSearchFilter[256] = "";
 std::vector<EtwProcessEvent> etwEventLog;
 
+// CONST REGISTRY TO SHOW MODIFIED IN REAL TIME
+const std::vector<std::pair<HKEY, std::wstring>> WATCHED_REG_KEYS = {
+    { HKEY_CURRENT_USER,   L"Software\\Microsoft\\Windows\\CurrentVersion\\Run" },
+    { HKEY_CURRENT_USER,   L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
+    { HKEY_LOCAL_MACHINE,  L"Software\\Microsoft\\Windows\\CurrentVersion\\Run" },
+    { HKEY_LOCAL_MACHINE,  L"Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
+    { HKEY_LOCAL_MACHINE,  L"Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run" },
+    { HKEY_LOCAL_MACHINE,  L"Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce" },
+    { HKEY_LOCAL_MACHINE,  L"System\\CurrentControlSet\\Services" },
+    { HKEY_LOCAL_MACHINE,  L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon" },
+    { HKEY_LOCAL_MACHINE,  L"Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options" },    
+    { HKEY_LOCAL_MACHINE,  L"System\\CurrentControlSet\\Control\\Session Manager" }
+};
 static NetworkConnectionItem selectedNetConn;
 bool EnableDebugPrivilege();
 bool GetSaveDumpFilePath(char* outPath, DWORD maxPath, HWND hwndOwner);
@@ -1221,6 +1240,82 @@ bool VerifyFileSignature(const std::wstring& filePath) {
     return (status == ERROR_SUCCESS);
 }
 
+std::unordered_map<std::string, std::string> GetRegistryValuesSnapshot(HKEY hKeyRoot, const std::wstring& subKeyPath) {
+    std::unordered_map<std::string, std::string> values;
+    HKEY hKey;
+    if (RegOpenKeyExW(hKeyRoot, subKeyPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        wchar_t valueName[256];
+        DWORD cchValueName = 256;
+        DWORD index = 0;
+
+        while (RegEnumValueW(hKey, index, valueName, &cchValueName, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+            int sz = WideCharToMultiByte(CP_UTF8, 0, valueName, -1, NULL, 0, NULL, NULL);
+            if (sz > 0) {
+                std::string sName(sz - 1, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, valueName, -1, &sName[0], sz, NULL, NULL);
+                values[sName] = "Exists";
+            }
+            cchValueName = 256;
+            index++;
+        }
+        RegCloseKey(hKey);
+    }
+    return values;
+}
+
+void StartRegistrySnapshotMonitor() {
+    std::thread([]() {
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> previousState;
+
+        for (const auto& entry : WATCHED_REG_KEYS) {
+            std::string rootName = (entry.first == HKEY_LOCAL_MACHINE) ? "HKLM\\" : "HKCU\\";
+            std::string fullPath = rootName + std::string(entry.second.begin(), entry.second.end());
+            previousState[fullPath] = GetRegistryValuesSnapshot(entry.first, entry.second);
+        }
+
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+
+            for (const auto& entry : WATCHED_REG_KEYS) {
+                std::string rootName = (entry.first == HKEY_LOCAL_MACHINE) ? "HKLM\\" : "HKCU\\";
+                std::string fullPath = rootName + std::string(entry.second.begin(), entry.second.end());
+
+                auto currentState = GetRegistryValuesSnapshot(entry.first, entry.second);
+                auto& prevState = previousState[fullPath];
+
+                for (const auto& [valName, valState] : currentState) {
+                    if (prevState.find(valName) == prevState.end()) {
+                        GlobalTimelineEvent regEv;
+                        regEv.timestamp = std::chrono::system_clock::now();
+                        regEv.timeString = GetCurrentSystemTimeString();
+                        regEv.type = TimelineEventType::RegistryAction;
+                        regEv.pid = 0;
+                        regEv.sourceProcess = "Foreground Snapshot Monitor";
+                        regEv.description = "Registry Key Created / Added: " + fullPath + "\\" + valName;
+                        regEv.displayColor = ImVec4(0.7f, 0.3f, 1.0f, 1.0f);
+                        g_GlobalTimelineQueue.Push(regEv);
+                    }
+                }
+
+                for (const auto& [valName, valState] : prevState) {
+                    if (currentState.find(valName) == currentState.end()) {
+                        GlobalTimelineEvent regEv;
+                        regEv.timestamp = std::chrono::system_clock::now();
+                        regEv.timeString = GetCurrentSystemTimeString();
+                        regEv.type = TimelineEventType::RegistryAction;
+                        regEv.pid = 0;
+                        regEv.sourceProcess = "Foreground Snapshot Monitor";
+                        regEv.description = "Registry Key Deleted: " + fullPath + "\\" + valName;
+                        regEv.displayColor = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+                        g_GlobalTimelineQueue.Push(regEv);
+                    }
+                }
+                prevState = currentState;
+            }
+        }
+    }).detach();
+}
+
 bool BuildLiveBootMedia(const std::string& targetDestination, bool isUsbTarget, std::string& liveStatus) {
     std::wstring tempDir = L"C:\\LiveBuilderTemp";
     std::wstring winpeMediaTemplate = L"C:\\Program Files (x86)\\Windows Kits\\10\\Assessment and Deployment Kit\\Windows Preinstallation Environment\\amd64\\Media";
@@ -1513,10 +1608,13 @@ bool IsMsiProductActive(const std::wstring& msiPath, std::wstring& outExeNames) 
     
     return isActiveOrHasExe;
 }
+
 static const GUID FileIoGuid = { 0x90cbdc39, 0x4a3e, 0x11d1, { 0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3 } };
+
 VOID WINAPI EventRecordCallback(PEVENT_RECORD pEventRecord) {
     BYTE* userData = (BYTE*)pEventRecord->UserData;
     if (!userData) return;
+    
     if (IsEqualGUID(pEventRecord->EventHeader.ProviderId, FileIoGuid)) {
         DWORD filePid = pEventRecord->EventHeader.ProcessId;
         if (filePid <= 4 || filePid == 0xFFFFFFFF) return;
@@ -1632,6 +1730,8 @@ VOID WINAPI EventRecordCallback(PEVENT_RECORD pEventRecord) {
 
 void StartEtwSessionThread() {
     std::thread([]() {
+        StartRegistrySnapshotMonitor();
+
         ULONG bufferSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(KERNEL_LOGGER_NAMEW) + 1) * sizeof(WCHAR);
         auto* pSessionProperties = (EVENT_TRACE_PROPERTIES*)malloc(bufferSize);
         if (!pSessionProperties) return;
@@ -2816,11 +2916,10 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     }
 
     if (!filterStr.empty() && !matchesFilter && !childMatches) return;
-
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
-
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_SpanAllColumns;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_AllowOverlap;
+    
     if (p.children.empty()) {
         flags |= ImGuiTreeNodeFlags_Leaf;
     }
@@ -2866,19 +2965,10 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
             isHandlesDllsLoading = true;
             showHandlesDlls = true;
 
-            std::thread([pid = handlesDllsPid, 
-                         &cachedHandles, 
-                         &cachedAdvancedModules, 
-                         &handlesError, 
-                         &advancedModulesError, 
-                         &isHandlesDllsLoading]() {
-                
-                OutputDebugStringA("Iniciando carga de Handles...\n");
+            std::thread([pid = handlesDllsPid, &cachedHandles, &cachedAdvancedModules, &handlesError, &advancedModulesError, &isHandlesDllsLoading]() {
                 std::string errH, errM;
                 auto handles = GetProcessHandles(pid, errH);
-                OutputDebugStringA("Handles terminados. Iniciando Advanced Modules...\n");
                 auto modules = GetAdvancedProcessModules(pid, errM);
-                OutputDebugStringA("Advanced Modules terminados.\n");
 
                 cachedHandles = std::move(handles);
                 cachedAdvancedModules = std::move(modules);
@@ -2894,68 +2984,14 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
             
             if (GetSaveDumpFilePath(customReportPath, MAX_PATH, hwnd)) {
                 EnableDebugPrivilege();
-                
                 std::ofstream report(customReportPath);
                 if (report.is_open()) {
                     report << "========================================\n";
-                    report << " NEXUSGLASSMANAGER - PROCESS FORENSIC REPORT\n";
+                    report << " FORENSIC TASK MANAGER - PROCESS REPORT\n";
                     report << "========================================\n";
                     report << "Process Name : " << p.name << "\n";
                     report << "Process ID   : " << p.pid << "\n";
                     report << "Executable   : " << p.exePath << "\n";
-                    report << "CPU Usage    : " << p.cpuUsage << "%\n";
-                    report << "Working Set  : " << (double)p.workingSetSize / (1024.0 * 1024.0) << " MB\n\n";
-
-                    report << "--- VIRTUAL MEMORY MAP ---\n";
-                    std::string memErr;
-                    std::vector<MemoryRegion> memRegions = GetProcessMemoryMap(p.pid, memErr);
-                    if (memErr.empty()) {
-                        for (const auto& mr : memRegions) {
-                            report << "Base: 0x" << std::hex << mr.baseAddress << std::dec 
-                                   << " | Size: " << mr.regionSize << " bytes"
-                                   << " | State: " << mr.state 
-                                   << " | Protect: " << mr.protect << "\n";
-                        }
-                    } else {
-                        report << "Error fetching memory map: " << memErr << "\n";
-                    }
-                    report << "\n";
-
-                    report << "--- LOADED MODULES (DLLs) ---\n";
-                    std::string modErr, thrErr;
-                    std::vector<ModuleInfoItem> mods = GetProcessModules(p.pid, modErr);
-                    if (modErr.empty()) {
-                        for (const auto& mod : mods) {
-                            report << "Module: " << mod.name << " | Path: " << mod.path << " | Base: 0x" << std::hex << mod.baseAddress << std::dec << "\n";
-                        }
-                    } else {
-                        report << "Error fetching modules: " << modErr << "\n";
-                    }
-                    report << "\n";
-
-                    report << "--- ACTIVE THREADS ---\n";
-                    std::vector<ThreadInfoItem> thrs = GetProcessThreads(p.pid, thrErr);
-                    if (thrErr.empty()) {
-                        for (const auto& th : thrs) {
-                            report << "Thread ID: " << th.tid << "\n";
-                        }
-                    } else {
-                        report << "Error fetching threads: " << thrErr << "\n";
-                    }
-                    report << "\n";
-
-                    report << "--- NETWORK CONNECTIONS ---\n";
-                    std::string connErr;
-                    std::vector<ConnectionInfoItem> conns = GetProcessConnections(p.pid, connErr);
-                    if (connErr.empty()) {
-                        for (const auto& c : conns) {
-                            report << "Proto: " << c.protocol << " | Local: " << c.localAddr << ":" << c.localPort 
-                                   << " | Remote: " << c.remoteAddr << ":" << c.remotePort << " | State: " << c.state << "\n";
-                        }
-                    } else {
-                        report << "Error fetching connections: " << connErr << "\n";
-                    }
-
                     report.close();
                 }
             }
@@ -2964,7 +3000,6 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         if (ImGui::MenuItem("Dump Memory to File...")) {
             char customDumpPath[MAX_PATH];
             snprintf(customDumpPath, sizeof(customDumpPath), "%s_dump.dmp", p.name.c_str());
-            
             if (GetSaveDumpFilePath(customDumpPath, MAX_PATH, hwnd)) {
                 EnableDebugPrivilege();
                 DumpCriticalProcessMemory(selectedPid, customDumpPath);
@@ -2997,8 +3032,9 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         }
         ImGui::EndPopup();
     }
+
     ImGui::TableSetColumnIndex(1); 
-    ImGui::Text("%lu", p.pid);
+    ImGui::Text("%lu", p.pid);    
     ImGui::TableSetColumnIndex(2); 
     ImGui::Text("%.1f%%", p.cpuUsage);
     ImGui::TableSetColumnIndex(3); 
@@ -3012,17 +3048,18 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     } else {
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "OK");
     }
+    
     ImGui::TableSetColumnIndex(5); 
     ImGui::Text("%s", p.exePath.c_str());
 
     if (isOpen) {
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                                    modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                    connectionsPid, showConnections, cachedConnections, connectionsError,
-                                    handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
-                                    cachedProcesses,
-                                    monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
+                                 modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                                 connectionsPid, showConnections, cachedConnections, connectionsError,
+                                 handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                                 cachedProcesses,
+                                 monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
