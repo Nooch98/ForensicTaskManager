@@ -19,28 +19,37 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
   * **ETW Live Monitor:** Utilizes live kernel event tracing to track process creation, termination, and detect suspicious process behavior in real time.
   * **Registry Snapshot & Persistence Monitor:** Periodically captures and compares low-level system states of critical Windows registry vectors (`Run`, `RunOnce`, `Services`, `Winlogon`, etc.) in a background worker thread, alerting on real-time key creations, modifications, or deletions.
   * **System Timeline:** A unified chronological dashboard providing granular visibility into system events, detailing process execution hours, network connections, kernel-level file creation/modification tracking, and registry alterations with customizable filters and auto-scroll support.
+* **Windows Defender Live Forensics & Scanner:**
+  * **Defender Live Viewer:** Real-time monitoring of threat detection logs, event threads, and system security alerts.
+  * **Detailed Forensic Reports:** Generates full detailed reports using all accumulated system events and security logs.
+  * **Real-Time On-Demand Scan (`MpScan`):** Triggers direct live system scans leveraging native Microsoft Defender scanning APIs (`MpScan`).
 * **Advanced Process Inspector & Forensics:**
-  * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents.
+  * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents, visually highlighting compromised nodes in the process tree with color-coded alerts.
   
   https://github.com/user-attachments/assets/665ccd5b-ba0f-4dc0-b842-5028e8f9eebb
+  * **Advanced Hover Tooltips:** Instant preview of process metadata on mouse-over, detailing PIDs, paths, command-line arguments, and specific anomaly rationales.
   * **Memory Injection & Anomaly Detection:** Scans process memory space for indicators of compromise, such as unbacked executable regions, anomalous protection states, or cross-process handles indicative of DLL/shellcode injection.
-  * **Handles & Advanced DLLs Inspector:** Asynchronous background extraction of process handles via native NT APIs alongside deep module validation.
+  * **Handles & Advanced DLLs Inspector:** Asynchronous background extraction of process handles via native NT APIs alongside deep module validation and linked DLL viewer integrations.
   * **Virtual Memory Map & String Search:** Enumerates memory regions, states, protections, types (`VirtualQueryEx`), and supports real-time background string extraction and filtering across memory sections.
   * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
-  * **Process Control & Incident Response:** Supports termination, command-line arguments inspection, and **Process Suspension (`NtSuspendProcess`)** to freeze malicious activities or ransomware in real-time.
+  * **Enhanced Process Control & Context Menus:** Reworked context menus supporting termination, command-line arguments inspection, and emergency **"Suspend & Dump"** actions using native APIs (`NtSuspendProcess`) to instantly freeze and safely capture volatile state or memory dumps (`MiniDumpWriteDump`) of active anomalies or ransomware in real-time.
   * **Detailed Process Reports:** Generates comprehensive offline forensic text reports for targeted processes.
   * **Authenticode Code Signing Verification:** Local validation of binary digital signatures using Win32 crypto APIs to flag unsigned or untrusted executables/drivers.
-  * **Process Memory Dumps:** Generates native application crash and mini-dumps (`MiniDumpWriteDump`) for offline analysis.
+  * **Process Memory Dumps:** Generates native application crash and mini-dumps for offline analysis.
 * **Digital Forensics & Artifact Parsers (DFIR):**
   * **Prefetch Analyzer:** Parses and inspects `.pf` prefetch files for execution history.
   * **MTF Parser:** Analyzes the NTFS Master File Table (MFT) for deep file system tracking.
   * **Registry Parser:** Inspects registry structures and hives.
+  * **USB History:** Tracks and analyzes connected USB device history and artifact footprints.
   * **Artifact Scanner:** Automated scanner for system artifacts and indicators of compromise.
   * **Event Logs:** Parses and reviews Windows event logs.
 * **Live System Imaging:** 
   * Initial implementation for creating live forensic ISO images (designed for offline analysis workflows; WinPE environment graphical adaptations in progress).
-* **Network & Socket Forensics:**
-  * Active TCP/UDP endpoint monitoring mapped directly to owner PIDs and process names.
+* **Network, Socket & Browser Forensics:**
+  * **Modular Sidebar Layout:** Reorganized tab system utilizing a clean sidebar menu interface.
+  * **Active Connections & Adapters:** Active TCP/UDP endpoint monitoring mapped directly to owner PIDs/process names, alongside system adapters configuration.
+  * **DNS Cache & History:** Inspection and clearing of local DNS caches.
+  * **Browser History Tab:** Dedicated tab to review browsing history and web artifacts extracted securely.
   * **Local Port & Heuristic Intelligence:** Built-in checks flagging anomalous or commonly abused ports (e.g., potential C2 or backdoor indicators) completely offline without third-party API dependencies.
 * **DLL Dependency Viewer:** Inspects native Portable Executable (PE) headers, imported APIs, and export symbols.
 * **System Maintenance & Utilities:** 
@@ -114,8 +123,6 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
   </tr>
 </table>
 
-
-
 ## Known Areas for Improvement (Learning In Progress)
 
 As an intermediate-to-advanced C++ learning project, several components are actively being refactored for better robustness:
@@ -129,8 +136,8 @@ As an intermediate-to-advanced C++ learning project, several components are acti
 * Windows 10 or 11
 * **MinGW-w64** (or a compatible `g++` compiler installed and added to your system PATH).
 
-### Quick Build (PowerShell Script)
-To avoid manual configuration or heavy IDE setups, you can use the provided automated PowerShell script (`build.ps1`), which compiles the source code, links the required Win32 and OpenGL libraries, and launches the application automatically.
+### Quick Build & Portable Packaging (PowerShell Script)
+To avoid manual configuration or heavy IDE setups, you can use the automated PowerShell script (`build.ps1`). It compiles the source code, links resource files (`app.res` / custom application manifests), and statically links all required Win32, OpenGL, and runtime libraries (`-static`, `-static-libgcc`, `-static-libstdc++`) to generate a **fully self-contained, standalone executable** (`ForensicTaskManager.exe`) capable of running on any clean Windows machine without missing DLL errors (such as `libwinpthread-1.dll`).
 
 1. Clone the repository:
    ```bash
