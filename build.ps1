@@ -29,12 +29,13 @@ $sources = @(
 $output = "ForensicTaskManager.exe"
 $includes = "-Iimgui", "-I."
 
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi"
+$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3"
 
-Write-Host "[INFO] Compiling source code and linking Win32 / OpenGL libraries..." -ForegroundColor Yellow
+$staticFlags = "-static", "-static-libgcc", "-static-libstdc++"
 
+Write-Host "[INFO] Compiling source code and statically linking libraries..." -ForegroundColor Yellow
 
-& g++ @sources -o $output @includes @libs -mwindows -static-libgcc -static-libstdc++
+& g++ @sources -o $output @includes @libs @staticFlags -mwindows
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "-----------------------------------------" -ForegroundColor Green
