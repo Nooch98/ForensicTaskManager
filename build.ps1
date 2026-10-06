@@ -29,7 +29,7 @@ $sources = @(
 $output = "ForensicTaskManager.exe"
 $includes = "-Iimgui", "-I."
 
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3"
+$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3", "-lbcrypt"
 
 $staticFlags = "-static", "-static-libgcc", "-static-libstdc++"
 
