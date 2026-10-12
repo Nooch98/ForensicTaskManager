@@ -6,55 +6,62 @@
 
 Forensic Task Manager is a custom Windows diagnostic utility that bridges low-level operating system APIs with an accelerated immediate-mode graphical user interface (GUI).
 
-* **UI Framework:** [Dear ImGui](https://github.com/ocornut/imgui) (Docking branch enabled) utilizing a custom skinning layer to achieve a dynamic Glassmorphism aesthetic.
-* **Graphics Backend:** OpenGL 3.0+ initialized directly through the Win32 window context (`wglCreateContext`).
-* **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, native NT APIs like `NtQuerySystemInformation`, etc.) to extract process data, memory maps, threads, modules, and network connections.
-* **Data Caching & Asynchronous Fetching:** Heavy diagnostic and blocking operations (such as system-wide handle enumeration and module parsing) are offloaded to background worker threads (`std::thread`) with selective safe-type object name resolution, ensuring zero UI stuttering or freezes during complex process analysis.
+- **UI Framework:** [Dear ImGui](https://github.com/ocornut/imgui) (Docking branch enabled) utilizing a custom skinning layer to achieve a dynamic Glassmorphism aesthetic.
+- **Graphics Backend:** OpenGL 3.0+ initialized directly through the Win32 window context (`wglCreateContext`).
+- **System Interfacing:** Directly queries the Windows SDK (`TlHelp32.h`, `Psapi.h`, `Iphlpapi.h`, native NT APIs like `NtQuerySystemInformation`, etc.) to extract process data, memory maps, threads, modules, and network connections.
+- **Data Caching & Asynchronous Fetching:** Heavy diagnostic and blocking operations (such as system-wide handle enumeration and module parsing) are offloaded to background worker threads (`std::thread`) with selective safe-type object name resolution, ensuring zero UI stuttering or freezes during complex process analysis.
+- **Process Lifecycle Management:** Sub-tools (such as the Desktop Widget) are spawned as standalone lightweight processes (`--widget`) synchronized with parent PID monitoring to ensure clean lifecycle control and memory cleanup.
 
 ## Core Features
 
-* **Glassmorphic UI Engine:** Real-time adjustable transparency slider and external theme configuration loader (`LoadThemesFromFile`) with persistent local state saving.
-* **Real-time Performance Graphs & Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
-* **ETW Kernel Telemetry & Real-Time Monitoring:**
+- **Glassmorphic UI Engine & Theme Customizer:** Real-time adjustable transparency slider, custom built-in **Theme Editor**, and external configuration loader with persistent state saving.
+- **Real-time Performance Graphs & Benchmarking System:**
+  * **Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
+  * **Performance Benchmarking (A vs. B):** 1-minute real-time CPU/RAM sample recorder and automated comparison reporting engine calculating usage deltas, peak maximums, and percentage variations against baseline saves.
+- **Standalone Desktop Widget:**
+  * Lightweight floating telemetry widget displaying CPU, RAM, GPU, Network, and Disk activity along with top 10 active processes (sortable by CPU/RAM usage).
+- **ETW Kernel Telemetry & Real-Time Monitoring:**
   * **ETW Live Monitor:** Utilizes live kernel event tracing to track process creation, termination, and detect suspicious process behavior in real time.
   * **Registry Snapshot & Persistence Monitor:** Periodically captures and compares low-level system states of critical Windows registry vectors (`Run`, `RunOnce`, `Services`, `Winlogon`, etc.) in a background worker thread, alerting on real-time key creations, modifications, or deletions.
   * **System Timeline:** A unified chronological dashboard providing granular visibility into system events, detailing process execution hours, network connections, kernel-level file creation/modification tracking, and registry alterations with customizable filters and auto-scroll support.
-* **Windows Defender Live Forensics & Scanner:**
+- **Windows Defender Live Forensics & Scanner:**
   * **Defender Live Viewer:** Real-time monitoring of threat detection logs, event threads, and system security alerts.
   * **Detailed Forensic Reports:** Generates full detailed reports using all accumulated system events and security logs.
   * **Real-Time On-Demand Scan (`MpScan`):** Triggers direct live system scans leveraging native Microsoft Defender scanning APIs (`MpScan`).
-* **Advanced Process Inspector & Forensics:**
+- **Advanced Process Inspector & Forensics:**
   * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents, visually highlighting compromised nodes in the process tree with color-coded alerts.
   
   https://github.com/user-attachments/assets/665ccd5b-ba0f-4dc0-b842-5028e8f9eebb
-  * **Advanced Hover Tooltips:** Instant preview of process metadata on mouse-over, detailing PIDs, paths, command-line arguments, and specific anomaly rationales.
+  * **Advanced Hover Tooltips & Online Lookup:** Instant preview of process metadata on mouse-over, detailing PIDs, paths, command-line arguments, alongside one-click web search capabilities.
   * **Memory Injection & Anomaly Detection:** Scans process memory space for indicators of compromise, such as unbacked executable regions, anomalous protection states, or cross-process handles indicative of DLL/shellcode injection.
   * **Handles & Advanced DLLs Inspector:** Asynchronous background extraction of process handles via native NT APIs alongside deep module validation and linked DLL viewer integrations.
   * **Virtual Memory Map & String Search:** Enumerates memory regions, states, protections, types (`VirtualQueryEx`), and supports real-time background string extraction and filtering across memory sections.
   * **Modules & Threads:** Lists loaded DLLs, base addresses, thread IDs, and base priorities.
-  * **Enhanced Process Control & Context Menus:** Reworked context menus supporting termination, command-line arguments inspection, and emergency **"Suspend & Dump"** actions using native APIs (`NtSuspendProcess`) to instantly freeze and safely capture volatile state or memory dumps (`MiniDumpWriteDump`) of active anomalies or ransomware in real-time.
+  * **Enhanced Process Control & Context Menus:** Reworked context menus supporting termination, deeper modal inspection, and emergency **"Suspend & Dump"** actions using native APIs (`NtSuspendProcess`) to instantly freeze and safely capture volatile state or memory dumps (`MiniDumpWriteDump`) of active anomalies or ransomware in real-time.
   * **Detailed Process Reports:** Generates comprehensive offline forensic text reports for targeted processes.
   * **Authenticode Code Signing Verification:** Local validation of binary digital signatures using Win32 crypto APIs to flag unsigned or untrusted executables/drivers.
   * **Process Memory Dumps:** Generates native application crash and mini-dumps for offline analysis.
-* **Digital Forensics & Artifact Parsers (DFIR):**
+- **Digital Forensics & Artifact Parsers (DFIR):**
   * **Prefetch Analyzer:** Parses and inspects `.pf` prefetch files for execution history.
   * **MTF Parser:** Analyzes the NTFS Master File Table (MFT) for deep file system tracking.
   * **Registry Parser:** Inspects registry structures and hives.
-  * **USB History:** Tracks and analyzes connected USB device history and artifact footprints.
+  * **Real-Time USB History:** Tracks connected USB devices by cross-referencing historical registry artifacts with live Windows PnP bus checks (`(Connected)` indicators).
   * **Artifact Scanner:** Automated scanner for system artifacts and indicators of compromise.
   * **Event Logs:** Parses and reviews Windows event logs.
-* **Live System Imaging:** 
+  * **Hardware Specification Audit:** Dedicated tab detailing live CPU, memory, motherboard, storage, and peripheral hardware telemetry.
+- **Live System Imaging:** 
   * Initial implementation for creating live forensic ISO images (designed for offline analysis workflows; WinPE environment graphical adaptations in progress).
-* **Network, Socket & Browser Forensics:**
+- **Network, Socket & Browser Forensics:**
   * **Modular Sidebar Layout:** Reorganized tab system utilizing a clean sidebar menu interface.
+  * **Network Map & Discovery:** Active local network scanner identifying connected devices, ARP entries, and highlighting the active **Internet Gateway Node / Hotspot**.
   * **Active Connections & Adapters:** Active TCP/UDP endpoint monitoring mapped directly to owner PIDs/process names, alongside system adapters configuration.
   * **DNS Cache & History:** Inspection and clearing of local DNS caches.
   * **Browser History Tab:** Dedicated tab to review browsing history and web artifacts extracted securely.
   * **Local Port & Heuristic Intelligence:** Built-in checks flagging anomalous or commonly abused ports (e.g., potential C2 or backdoor indicators) completely offline without third-party API dependencies.
-* **DLL Dependency Viewer:** Inspects native Portable Executable (PE) headers, imported APIs, and export symbols.
-* **System Maintenance & Utilities:** 
+- **DLL Dependency Viewer:** Inspects native Portable Executable (PE) headers, imported APIs, and export symbols.
+- **System Maintenance & Utilities:** 
   * **Windows Services Manager:** Interactive control to query, start, and stop system services.
-  * **Startup & Installed Software:** Startup application optimizer, environment variables inspector, and installed software manager with uninstaller execution.
+  * **Startup & Installed Software:** Startup application optimizer, environment variables inspector (with dual general/path-specific tabs), and installed software manager with uninstaller execution.
   * **Windows Installer Analyzer (`C:\Windows\Installer` Audit):** Deep inspection tool utilizing MSI APIs and Windows Registry cross-referencing (`UserData` and `Classes`) to safely audit cached packages (`.msi`, `.msp`) and unassociated directories, identifying active versus orphaned items for forensic storage footprint evaluation without risking system stability.
   * **Quick System Maintenance:** Built-in shortcuts for temporary file cleanup, recycle bin emptying, DNS cache flushing, Winsock/IP resets, and automated SFC/DISM system integrity scans.
 
@@ -126,15 +133,15 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 ## Known Areas for Improvement (Learning In Progress)
 
 As an intermediate-to-advanced C++ learning project, several components are actively being refactored for better robustness:
-* **RAII & Resource Safety:** Transitioning raw Win32 handle management (`CloseHandle`) to smart wrappers to completely prevent handle/memory leaks during error states.
-* **Concurrency:** Refining how cached data structures are updated and safely read across timing loops to prevent race conditions.
-* **Error Handling:** Replacing basic string error messages with a more unified exception or result-type pattern.
+- **RAII & Resource Safety:** Transitioning raw Win32 handle management (`CloseHandle`) to smart wrappers to completely prevent handle/memory leaks during error states.
+- **Concurrency:** Refining how cached data structures are updated and safely read across timing loops to prevent race conditions.
+- **Error Handling:** Replacing basic string error messages with a more unified exception or result-type pattern.
 
 ## Building and Running the Project
 
 ### Prerequisites
-* Windows 10 or 11
-* **MinGW-w64** (or a compatible `g++` compiler installed and added to your system PATH).
+- Windows 10 or 11
+- **MinGW-w64** (or a compatible `g++` compiler installed and added to your system PATH).
 
 ### Quick Build & Portable Packaging (PowerShell Script)
 To avoid manual configuration or heavy IDE setups, you can use the automated PowerShell script (`build.ps1`). It compiles the source code, links resource files (`app.res` / custom application manifests), and statically links all required Win32, OpenGL, and runtime libraries (`-static`, `-static-libgcc`, `-static-libstdc++`) to generate a **fully self-contained, standalone executable** (`ForensicTaskManager.exe`) capable of running on any clean Windows machine without missing DLL errors (such as `libwinpthread-1.dll`).
