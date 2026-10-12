@@ -17,6 +17,7 @@ Write-Host "[INFO] Preparing source files and backend configurations..." -Foregr
 
 $sources = @(
     "taskmanager.cpp",
+    "desktop_widget.cpp",
     "app.res",
     "imgui/imgui.cpp",
     "imgui/imgui_draw.cpp",
@@ -29,7 +30,7 @@ $sources = @(
 $output = "ForensicTaskManager.exe"
 $includes = "-Iimgui", "-I."
 
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3", "-lbcrypt"
+$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3", "-lbcrypt", "-lsetupapi", "-lpdh"
 
 $staticFlags = "-static", "-static-libgcc", "-static-libstdc++"
 
