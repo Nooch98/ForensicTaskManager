@@ -47,6 +47,9 @@
 #include <intrin.h>
 #include <setupapi.h>
 #include <devguid.h>
+#include <winhttp.h>
+#include <ntsecapi.h>
+#include <winternl.h>
 #include "desktop_widget.h"
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -60,35 +63,24 @@
 #pragma comment(lib, "tdh.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "secur32.lib")
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 #endif
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_opengl3.h"
 
-#ifndef _UNICODE_STRING_DEFINED
-#define _UNICODE_STRING_DEFINED
-typedef struct _UNICODE_STRING {
-    USHORT Length;
-    USHORT MaximumLength;
-    PWSTR  Buffer;
-} UNICODE_STRING, *PUNICODE_STRING;
-#endif
-
 #ifndef SystemHandleInformation
 #define SystemHandleInformation ((SYSTEM_INFORMATION_CLASS)64)
 #endif
-
-typedef enum _OBJECT_INFORMATION_CLASS {
-    ObjectBasicInformation = 0,
-    ObjectNameInformation = 1,
-    ObjectTypeInformation = 2,
-    ObjectAllInformation = 3,
-    ObjectDataInformation = 4
-} OBJECT_INFORMATION_CLASS;
 
 typedef NTSTATUS(WINAPI* PFN_NT_QUERY_SYSTEM_INFORMATION)(
     ULONG SystemInformationClass,
@@ -159,6 +151,7 @@ struct ProcessInfo {
     float cpuUsage;
     std::string priorityStr = "Normal";
     bool isParentSpoofed = false;
+    bool isSigned;
     std::string spoofingReason = "";
     std::vector<ProcessInfo> children;
 };
@@ -443,6 +436,29 @@ struct BrowserHistoryEntry {
     std::string title;
     std::string timestamp;
 };
+
+struct BrowserCookieEntry {
+    std::string browserName;
+    std::string hostKey;
+    std::string name;
+    std::string value;
+    std::string creationUtc;
+};
+
+struct BrowserDownloadEntry {
+    std::string browserName;
+    std::string targetPath;
+    std::string tabUrl;
+    std::string startTime;
+    std::string receivedBytes;
+};
+
+struct BrowserTarget {
+        std::string name;
+        std::string dbPath;
+        bool isFirefox;
+    };
+
 std::string historyStatusMsg = "Listo";
 std::vector<BrowserHistoryEntry> cachedBrowserHistory;
 
@@ -478,6 +494,29 @@ struct CPUInfo {
     std::string name = "Unknown CPU";
     DWORD physicalCores = 0;
     DWORD logicalThreads = 0;
+};
+
+struct SignatureDetails {
+    bool isSigned = false;
+    std::string signerName = "Unsigned / Invalid";
+};
+
+struct LogonSessionItem {
+    ULONG logonIdLow;
+    ULONG logonIdHigh;
+    std::string username;
+    std::string domain;
+    std::string logonTypeStr;
+    std::string logonTime;
+    std::string logonServer;
+};
+
+struct LogonSessionsData {
+    std::vector<LogonSessionItem> sessions;
+    int interactiveCount = 0;
+    int remoteRdpCount = 0;
+    int networkCount = 0;
+    int serviceCount = 0;
 };
 
 std::vector<InstallerItem> g_InstallerItems;
@@ -680,10 +719,25 @@ struct HardwareSpec {
 static HardwareSpec cachedHardware;
 static bool hardwareInfoInitialized = false;
 
+// IP GEOLOCATION
+static std::unordered_map<std::string, std::string> g_geoCache;
+static std::mutex g_geoMutex;
+
 // DESKTOP WIDGET
 static bool showDesktopWidget = false;
 static PROCESS_INFORMATION piWidget = { 0 };
 
+// PROCESS VERIFY SIGNATURE
+static std::unordered_map<std::string, bool> g_SignatureCache;
+static std::mutex g_SignatureMutex;
+
+// LOGON SESSION
+static LogonSessionsData cachedLogonSessions;
+static bool logonSessionsInitialized = false;
+
+// WEBBROWSER COOKIES AND DOWNLOADS
+static std::vector<BrowserCookieEntry> cachedBrowserCookies;
+static std::vector<BrowserDownloadEntry> cachedBrowserDownloads;
 
 // CONST REGISTRY TO SHOW MODIFIED IN REAL TIME
 const std::vector<std::pair<HKEY, std::wstring>> WATCHED_REG_KEYS = {
@@ -1797,6 +1851,140 @@ public:
 ThreadSafeQueue<GlobalTimelineEvent> g_GlobalTimelineQueue;
 std::vector<GlobalTimelineEvent> g_GlobalTimelineLog;
 
+SignatureDetails CheckFileDigitalSignature(const std::string& filePath) {
+    SignatureDetails details;
+    if (filePath == "N/A" || filePath.empty()) {
+        details.isSigned = false;
+        details.signerName = "N/A";
+        return details;
+    }
+
+    std::wstring widePath(filePath.begin(), filePath.end());
+
+    WINTRUST_FILE_INFO fileInfo = {};
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = widePath.c_str();
+
+    WINTRUST_DATA trustData = {};
+    trustData.cbStruct = sizeof(WINTRUST_DATA);
+    trustData.dwUIChoice = WTD_UI_NONE;
+    trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trustData.dwUnionChoice = WTD_CHOICE_FILE;
+    trustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    trustData.pFile = &fileInfo;
+
+    GUID actionId = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG status = WinVerifyTrust(NULL, &actionId, &trustData);
+
+    if (status == ERROR_SUCCESS) {
+        details.isSigned = true;
+        details.signerName = "Valid Signature (Trusted)";
+    } else {
+        details.isSigned = false;
+        details.signerName = "Unsigned / Invalid";
+    }
+
+    trustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &actionId, &trustData);
+
+    return details;
+}
+
+std::string GetLogonTypeString(ULONG logonType) {
+    switch (logonType) {
+        case 2:  return "Interactive (Local Console)";
+        case 3:  return "Network (SMB/Share)";
+        case 4:  return "Batch (Scheduled Task)";
+        case 5:  return "Service";
+        case 6:  return "Proxy";
+        case 7:  return "Unlock Workstation";
+        case 8:  return "Network Cleartext";
+        case 9:  return "New Credentials";
+        case 10: return "Remote Interactive (RDP)";
+        case 11: return "Cached Interactive";
+        case 12: return "Cached Remote Interactive";
+        case 13: return "Cached Unlock";
+        default: return "Type (" + std::to_string(logonType) + ")";
+    }
+}
+
+LogonSessionsData GetActiveLogonSessions() {
+    LogonSessionsData data;
+    ULONG sessionCount = 0;
+    PLUID logonSessionList = NULL;
+
+    if (LsaEnumerateLogonSessions(&sessionCount, &logonSessionList) == STATUS_SUCCESS) {
+        for (ULONG i = 0; i < sessionCount; ++i) {
+            PSECURITY_LOGON_SESSION_DATA sessionData = NULL;
+            if (LsaGetLogonSessionData(&logonSessionList[i], &sessionData) == STATUS_SUCCESS) {
+                if (sessionData != NULL) {
+                    LogonSessionItem item;
+                    item.logonIdLow = sessionData->LogonId.LowPart;
+                    item.logonIdHigh = sessionData->LogonId.HighPart;
+
+                    if (sessionData->UserName.Buffer) {
+                        int len = WideCharToMultiByte(CP_UTF8, 0, sessionData->UserName.Buffer, sessionData->UserName.Length / sizeof(WCHAR), NULL, 0, NULL, NULL);
+                        std::string uname(len, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, sessionData->UserName.Buffer, sessionData->UserName.Length / sizeof(WCHAR), &uname[0], len, NULL, NULL);
+                        item.username = uname;
+                    } else {
+                        item.username = "N/A";
+                    }
+
+                    if (sessionData->LogonDomain.Buffer) {
+                        int len = WideCharToMultiByte(CP_UTF8, 0, sessionData->LogonDomain.Buffer, sessionData->LogonDomain.Length / sizeof(WCHAR), NULL, 0, NULL, NULL);
+                        std::string domain(len, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, sessionData->LogonDomain.Buffer, sessionData->LogonDomain.Length / sizeof(WCHAR), &domain[0], len, NULL, NULL);
+                        item.domain = domain;
+                    } else {
+                        item.domain = "N/A";
+                    }
+
+                    item.logonTypeStr = GetLogonTypeString(sessionData->LogonType);
+
+                    if (sessionData->LogonType == 2) data.interactiveCount++;
+                    else if (sessionData->LogonType == 10) data.remoteRdpCount++;
+                    else if (sessionData->LogonType == 3) data.networkCount++;
+                    else if (sessionData->LogonType == 5) data.serviceCount++;
+
+                    ULARGE_INTEGER ularge;
+                    ularge.LowPart = sessionData->LogonTime.LowPart;
+                    ularge.HighPart = sessionData->LogonTime.HighPart;
+                    if (ularge.QuadPart > 0) {
+                        FILETIME ft;
+                        ft.dwLowDateTime = sessionData->LogonTime.LowPart;
+                        ft.dwHighDateTime = sessionData->LogonTime.HighPart;
+                        SYSTEMTIME stUTC, stLocal;
+                        FileTimeToSystemTime(&ft, &stUTC);
+                        SystemTimeToTzSpecificLocalTime(NULL, &stUTC, &stLocal);
+                        char timeBuf[64];
+                        snprintf(timeBuf, sizeof(timeBuf), "%04d-%02d-%02d %02d:%02d:%02d",
+                                 stLocal.wYear, stLocal.wMonth, stLocal.wDay,
+                                 stLocal.wHour, stLocal.wMinute, stLocal.wSecond);
+                        item.logonTime = timeBuf;
+                    } else {
+                        item.logonTime = "N/A";
+                    }
+
+                    if (sessionData->LogonServer.Buffer) {
+                        int len = WideCharToMultiByte(CP_UTF8, 0, sessionData->LogonServer.Buffer, sessionData->LogonServer.Length / sizeof(WCHAR), NULL, 0, NULL, NULL);
+                        std::string srv(len, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, sessionData->LogonServer.Buffer, sessionData->LogonServer.Length / sizeof(WCHAR), &srv[0], len, NULL, NULL);
+                        item.logonServer = srv;
+                    } else {
+                        item.logonServer = "-";
+                    }
+
+                    data.sessions.push_back(item);
+                    LsaFreeReturnBuffer(sessionData);
+                }
+            }
+        }
+        LsaFreeReturnBuffer(logonSessionList);
+    }
+    return data;
+}
+
 bool EnableDebugPrivilege() {
     HANDLE hToken = NULL;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
@@ -1900,6 +2088,92 @@ bool VerifyFileSignature(const std::wstring& filePath) {
     WinVerifyTrust(NULL, &policyGuid, &trustData);
 
     return (status == ERROR_SUCCESS);
+}
+
+static void AsyncFetchGeoIP(std::string target) {
+    std::string ip = target;
+    size_t colonPos = target.find(':');
+    if (colonPos != std::string::npos) {
+        ip = target.substr(0, colonPos);
+    }
+
+    if (ip == "127.0.0.1" || ip == "0.0.0.0" || ip.rfind("192.168.", 0) == 0 || ip.rfind("10.", 0) == 0 || ip.rfind("172.", 0) == 0) {
+        std::lock_guard<std::mutex> lock(g_geoMutex);
+        g_geoCache[target] = "Local Network (LAN)";
+        return;
+    }
+
+    HINTERNET hSession = WinHttpOpen(L"ForensicTaskManager/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, L"ip-api.com", INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return;
+    }
+
+    std::wstring path = L"/json/" + std::wstring(ip.begin(), ip.end()) + L"?fields=status,country,city,isp,org";
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    
+    if (hRequest && WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hRequest, NULL)) {
+        
+        DWORD dwSize = 0;
+        DWORD dwDownloaded = 0;
+        std::string response;
+
+        do {
+            dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+            if (dwSize == 0) break;
+
+            std::vector<char> buffer(dwSize + 1, 0);
+            if (WinHttpReadData(hRequest, buffer.data(), dwSize, &dwDownloaded)) {
+                response.append(buffer.data(), dwDownloaded);
+            }
+        } while (dwSize > 0);
+
+        std::string country = "";
+        std::string city = "";
+        std::string isp = "";
+
+        auto extractJsonVal = [&](const std::string& key) {
+            size_t pos = response.find("\"" + key + "\":\"");
+            if (pos == std::string::npos) return std::string("");
+            size_t start = pos + key.length() + 4;
+            size_t end = response.find("\"", start);
+            return (end != std::string::npos) ? response.substr(start, end - start) : std::string("");
+        };
+
+        country = extractJsonVal("country");
+        city = extractJsonVal("city");
+        isp = extractJsonVal("isp");
+        if (isp.empty()) isp = extractJsonVal("org");
+
+        std::string result = "Unknown";
+        if (!country.empty()) {
+            result = country;
+            if (!city.empty()) result += ", " + city;
+            if (!isp.empty()) result += " [" + isp + "]";
+        }
+
+        std::lock_guard<std::mutex> lock(g_geoMutex);
+        g_geoCache[target] = result;
+    }
+
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+}
+
+static std::string GetCachedGeo(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(g_geoMutex);
+    auto it = g_geoCache.find(ip);
+    if (it != g_geoCache.end()) {
+        return it->second;
+    }
+    return "";
 }
 
 static std::string CalculateSHA256(const std::string& filePath) {
@@ -2386,6 +2660,49 @@ std::vector<std::string> GetDiskInfoList() {
         disks.push_back("No local drives detected");
     }
     return disks;
+}
+
+bool IsProcessIsolated(DWORD pid) {
+    if (pid == 0) return false;
+    std::string ruleName = "ForensicTM_Isolate_" + std::to_string(pid) + "_Out";
+    std::string cmd = "netsh advfirewall firewall show rule name=\"" + ruleName + "\" >nul 2>&1";
+    return (system(cmd.c_str()) == 0);
+}
+
+void BlockProcessViaFirewall(DWORD pid) {
+    if (pid == 0) return;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!hProcess) return;
+
+    char szPath[MAX_PATH];
+    if (GetModuleFileNameExA(hProcess, NULL, szPath, MAX_PATH)) {
+        CloseHandle(hProcess);
+        std::string exePath(szPath);
+        std::string ruleName = "ForensicTM_Isolate_" + std::to_string(pid);
+
+        std::string cmdOut = "netsh advfirewall firewall add rule name=\"" + ruleName + "_Out\" dir=out program=\"" + exePath + "\" action=block >nul 2>&1";
+        std::string cmdIn  = "netsh advfirewall firewall add rule name=\"" + ruleName + "_In\" dir=in program=\"" + exePath + "\" action=block >nul 2>&1";
+
+        std::thread([cmdOut, cmdIn]() {
+            system(cmdOut.c_str());
+            system(cmdIn.c_str());
+        }).detach();
+    } else {
+        CloseHandle(hProcess);
+    }
+}
+
+void UnblockProcessViaFirewall(DWORD pid) {
+    if (pid == 0) return;
+    std::string ruleName = "ForensicTM_Isolate_" + std::to_string(pid);
+    
+    std::string cmdDelOut = "netsh advfirewall firewall delete rule name=\"" + ruleName + "_Out\" >nul 2>&1";
+    std::string cmdDelIn  = "netsh advfirewall firewall delete rule name=\"" + ruleName + "_In\" >nul 2>&1";
+
+    std::thread([cmdDelOut, cmdDelIn]() {
+        system(cmdDelOut.c_str());
+        system(cmdDelIn.c_str());
+    }).detach();
 }
 
 void GetLatestKeyWriteTime(HKEY hKey, FILETIME& latestTime) {
@@ -3687,101 +4004,396 @@ void ReadMozillaHistory(const std::string& profilesBasePath, std::vector<Browser
     std::string searchPattern = profilesBasePath + "*";
     HANDLE hFind = FindFirstFileA(searchPattern.c_str(), &findData);
     
-    if (hFind != INVALID_HANDLE_VALUE) {
-        do {
-            if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                std::string folderName(findData.cFileName);
-                if (folderName == "." || folderName == "..") continue;
+    if (hFind == INVALID_HANDLE_VALUE) {
+        historyStatusMsg = "Firefox: Profiles path not found.";
+        return;
+    }
 
-                std::string folderLower = folderName;
-                std::transform(folderLower.begin(), folderLower.end(), folderLower.begin(), ::tolower);
+    int foundProfiles = 0;
+    int successfullyRead = 0;
+    std::string lastErrorDetails = "";
 
-                bool isNightly = (folderLower.find(".default-nightly") != std::string::npos || folderLower.find("nightly") != std::string::npos);
-                bool isStandardRelease = (folderLower.find(".default-release") != std::string::npos || folderLower.find(".default") != std::string::npos);
+    do {
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            std::string folderName(findData.cFileName);
+            if (folderName == "." || folderName == "..") continue;
 
-                if (!isNightly && !isStandardRelease) {
-                    continue;
-                }
+            std::string placesPath = profilesBasePath + folderName + "\\places.sqlite";
+            
+            DWORD attrib = GetFileAttributesA(placesPath.c_str());
+            if (attrib == INVALID_FILE_ATTRIBUTES || (attrib & FILE_ATTRIBUTE_DIRECTORY)) {
+                continue; 
+            }
 
-                std::string browserName = isNightly ? "Firefox Nightly" : "Mozilla Firefox";
-                std::string placesPath = profilesBasePath + folderName + "\\places.sqlite";
+            foundProfiles++;
+            std::string folderLower = folderName;
+            std::transform(folderLower.begin(), folderLower.end(), folderLower.begin(), ::tolower);
+            bool isNightly = (folderLower.find("nightly") != std::string::npos);
+            std::string browserName = isNightly ? "Firefox Nightly" : "Mozilla Firefox";
+
+            char tempPath[MAX_PATH];
+            GetTempPathA(MAX_PATH, tempPath);
+            std::string tempCopyPath = std::string(tempPath) + "temp_places_" + folderName + ".sqlite";
+
+            bool readSuccess = false;
+            sqlite3* db = nullptr;
+
+            if (CopyFileA(placesPath.c_str(), tempCopyPath.c_str(), FALSE)) {
+                std::string tempNormalized = tempCopyPath;
+                for (char& c : tempNormalized) if (c == '\\') c = '/';
+                std::string tempUri = "file:///" + tempNormalized + "?mode=ro";
                 
-                DWORD attrib = GetFileAttributesA(placesPath.c_str());
-                if (attrib == INVALID_FILE_ATTRIBUTES || (attrib & FILE_ATTRIBUTE_DIRECTORY)) {
-                    continue;
+                if (sqlite3_open_v2(tempUri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+                    readSuccess = true;
+                } else {
+                    lastErrorDetails = sqlite3_errmsg(db);
+                    if (db) { sqlite3_close(db); db = nullptr; }
                 }
+            } else {
+                lastErrorDetails = "CopyFile failed (Error " + std::to_string(GetLastError()) + ")";
+            }
 
-                std::string normalizedPath = placesPath;
-                for (char& c : normalizedPath) {
-                    if (c == '\\') c = '/';
-                }
-
-                sqlite3* db = nullptr;
-                std::string uri = "file:///" + normalizedPath + "?mode=ro";
-                int rc = sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+            if (readSuccess && db) {
+                const char* sql = "SELECT moz_places.url, moz_places.title, datetime(moz_historyvisits.visit_date / 1000000, 'unixepoch', 'localtime') as visit_time FROM moz_places JOIN moz_historyvisits ON moz_places.id = moz_historyvisits.place_id ORDER BY moz_historyvisits.visit_date DESC LIMIT 300;";
+                sqlite3_stmt* stmt = nullptr;
                 
-                std::string tempCopyPath = "";
-                if (rc != SQLITE_OK) {
-                    tempCopyPath = "temp_places_" + folderName + ".sqlite";
-                    if (CopyFileA(placesPath.c_str(), tempCopyPath.c_str(), FALSE)) {
-                        std::string tempNormalized = tempCopyPath;
-                        for (char& c : tempNormalized) if (c == '\\') c = '/';
-                        std::string tempUri = "file:///" + tempNormalized + "?mode=ro";
-                        rc = sqlite3_open_v2(tempUri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+                if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+                    int countBefore = entries.size();
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        BrowserHistoryEntry entry;
+                        entry.browserName = browserName;
+                        
+                        const char* url_c = (const char*)sqlite3_column_text(stmt, 0);
+                        const char* title_c = (const char*)sqlite3_column_text(stmt, 1);
+                        const char* time_c = (const char*)sqlite3_column_text(stmt, 2);
+                        
+                        entry.url = url_c ? url_c : "";
+                        entry.title = title_c ? title_c : "";
+                        entry.timestamp = time_c ? time_c : "";
+                        
+                        entries.push_back(entry);
                     }
+                    if (entries.size() > countBefore) {
+                        successfullyRead++;
+                    } else {
+                        lastErrorDetails = "SQL executed, 0 rows returned";
+                    }
+                    sqlite3_finalize(stmt);
+                } else {
+                    lastErrorDetails = "Prepare failed: " + std::string(sqlite3_errmsg(db));
                 }
+                sqlite3_close(db);
+            }
 
-                if (rc == SQLITE_OK && db) {
-                    const char* sql = "SELECT moz_places.url, moz_places.title, datetime(moz_historyvisits.visit_time / 1000000, 'unixepoch', 'localtime') as visit_time FROM moz_places JOIN moz_historyvisits ON moz_places.id = moz_historyvisits.place_id ORDER BY moz_historyvisits.visit_time DESC LIMIT 300;";
-                    sqlite3_stmt* stmt = nullptr;
+            DeleteFileA(tempCopyPath.c_str());
+        }
+    } while (FindNextFileA(hFind, &findData));
+    FindClose(hFind);
+
+    if (foundProfiles == 0) {
+        historyStatusMsg = "Firefox: No profiles found.";
+    } else if (successfullyRead == 0) {
+        historyStatusMsg = "Firefox Error: " + lastErrorDetails;
+    } else {
+        historyStatusMsg = "Firefox loaded successfully!";
+    }
+}
+
+std::vector<BrowserCookieEntry> LoadBrowserCookies() {
+    std::vector<BrowserCookieEntry> cookies;
+    char* localAppDataEnv = nullptr;
+    char* appDataEnv = nullptr;
+    size_t len1 = 0, len2 = 0;
+
+    _dupenv_s(&localAppDataEnv, &len1, "LOCALAPPDATA");
+    _dupenv_s(&appDataEnv, &len2, "APPDATA");
+
+    std::vector<std::pair<std::string, std::string>> chromiumTargets;
+
+    if (localAppDataEnv != nullptr) {
+        std::string localApp(localAppDataEnv);
+        chromiumTargets = {
+            { "Google Chrome", localApp + "\\Google\\Chrome\\User Data\\Default\\Network\\Cookies" },
+            { "Google Chrome", localApp + "\\Google\\Chrome\\User Data\\Default\\Cookies" },
+            { "Microsoft Edge", localApp + "\\Microsoft\\Edge\\User Data\\Default\\Network\\Cookies" },
+            { "Microsoft Edge", localApp + "\\Microsoft\\Edge\\User Data\\Default\\Cookies" },
+            { "Brave Browser", localApp + "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Network\\Cookies" },
+            { "Brave Browser", localApp + "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cookies" }
+        };
+    }
+
+    for (const auto& target : chromiumTargets) {
+        sqlite3* db = nullptr;
+        if (sqlite3_open_v2(target.second.c_str(), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+            std::string sql = "SELECT host_key, name, creation_utc FROM cookies LIMIT 300;";
+            sqlite3_stmt* stmt = nullptr;
+
+            if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const char* host = (const char*)sqlite3_column_text(stmt, 0);
+                    const char* name = (const char*)sqlite3_column_text(stmt, 1);
                     
-                    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-                        while (sqlite3_step(stmt) == SQLITE_ROW) {
-                            BrowserHistoryEntry entry;
-                            entry.browserName = browserName;
-                            
-                            const char* url_c = (const char*)sqlite3_column_text(stmt, 0);
-                            const char* title_c = (const char*)sqlite3_column_text(stmt, 1);
-                            const char* time_c = (const char*)sqlite3_column_text(stmt, 2);
-                            
-                            entry.url = url_c ? url_c : "";
-                            entry.title = title_c ? title_c : "";
-                            entry.timestamp = time_c ? time_c : "";
-                            
-                            entries.push_back(entry);
-                        }
-                        sqlite3_finalize(stmt);
-                    }
-                    sqlite3_close(db);
-                }
+                    BrowserCookieEntry entry;
+                    entry.browserName = target.first;
+                    entry.hostKey = host ? host : "";
+                    entry.name = name ? name : "";
+                    entry.value = "[Encrypted by DPAPI]";
+                    entry.creationUtc = "Registered";
 
-                if (!tempCopyPath.empty()) {
-                    DeleteFileA(tempCopyPath.c_str());
+                    cookies.push_back(entry);
+                }
+                sqlite3_finalize(stmt);
+            }
+            sqlite3_close(db);
+        }
+    }
+
+    if (appDataEnv != nullptr) {
+        std::string roamingApp(appDataEnv);
+        std::vector<std::string> firefoxProfileDirs = {
+            roamingApp + "\\Mozilla\\Firefox\\Profiles",
+            roamingApp + "\\Waterfox",
+            roamingApp + "\\Mozilla\\Firefox Nightly\\Profiles"
+        };
+
+        for (const auto& baseDir : firefoxProfileDirs) {
+            if (fs::exists(baseDir) && fs::is_directory(baseDir)) {
+                for (const auto& entry : fs::directory_iterator(baseDir)) {
+                    if (entry.is_directory()) {
+                        std::string cookiesFilePath = entry.path().string() + "\\cookies.sqlite";
+                        if (fs::exists(cookiesFilePath)) {
+                            sqlite3* db = nullptr;
+                            if (sqlite3_open_v2(cookiesFilePath.c_str(), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                                std::string sql = "SELECT host, name, SUBSTR(value, 1, 40) FROM moz_cookies LIMIT 300;";
+                                sqlite3_stmt* stmt = nullptr;
+
+                                if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, NULL) == SQLITE_OK) {
+                                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                                        const char* host = (const char*)sqlite3_column_text(stmt, 0);
+                                        const char* name = (const char*)sqlite3_column_text(stmt, 1);
+                                        const char* val = (const char*)sqlite3_column_text(stmt, 2);
+
+                                        BrowserCookieEntry cookieEntry;
+                                        cookieEntry.browserName = "Mozilla Firefox";
+                                        cookieEntry.hostKey = host ? host : "";
+                                        cookieEntry.name = name ? name : "";
+                                        cookieEntry.value = val ? val : "";
+                                        cookieEntry.creationUtc = "Plaintext (Firefox)";
+
+                                        cookies.push_back(cookieEntry);
+                                    }
+                                    sqlite3_finalize(stmt);
+                                }
+                                sqlite3_close(db);
+                            }
+                        }
+                    }
                 }
             }
-        } while (FindNextFileA(hFind, &findData));
-        FindClose(hFind);
+        }
     }
+
+    if (localAppDataEnv) free(localAppDataEnv);
+    if (appDataEnv) free(appDataEnv);
+
+    return cookies;
+}
+
+std::vector<BrowserDownloadEntry> LoadBrowserDownloads() {
+    std::vector<BrowserDownloadEntry> downloads;
+    char* localAppDataEnv = nullptr;
+    char* appDataEnv = nullptr;
+    size_t len1 = 0, len2 = 0;
+
+    _dupenv_s(&localAppDataEnv, &len1, "LOCALAPPDATA");
+    _dupenv_s(&appDataEnv, &len2, "APPDATA");
+
+    std::vector<std::pair<std::string, std::string>> chromiumTargets;
+
+    if (localAppDataEnv != nullptr) {
+        std::string localApp(localAppDataEnv);
+        chromiumTargets = {
+            { "Google Chrome", localApp + "\\Google\\Chrome\\User Data\\Default\\History" },
+            { "Google Chrome", localApp + "\\Google\\Chrome\\User Data\\Profile 1\\History" },
+            { "Microsoft Edge", localApp + "\\Microsoft\\Edge\\User Data\\Default\\History" },
+            { "Brave Browser", localApp + "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\History" },
+            { "Brave Browser", localApp + "\\BraveSoftware\\Brave-Browser\\User Data\\Profile 1\\History" }
+        };
+    }
+
+    for (const auto& target : chromiumTargets) {
+        if (!fs::exists(target.second)) continue;
+
+        sqlite3* db = nullptr;
+        std::string uri = "file:" + target.second + "?mode=ro";
+        if (sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+            std::string sql = 
+                "SELECT d.target_path, COALESCE(u.url, d.tab_url, ''), d.received_bytes, "
+                "datetime(d.start_time / 1000000 - 11644473600, 'unixepoch', 'localtime') AS formatted_time "
+                "FROM downloads d "
+                "LEFT JOIN downloads_url_chains u ON d.id = u.id "
+                "ORDER BY d.start_time DESC LIMIT 200;";
+            
+            sqlite3_stmt* stmt = nullptr;
+            if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, NULL) == SQLITE_OK) {
+                while (sqlite3_step(stmt) == SQLITE_ROW) {
+                    const char* path = (const char*)sqlite3_column_text(stmt, 0);
+                    const char* url = (const char*)sqlite3_column_text(stmt, 1);
+                    sqlite3_int64 bytes = sqlite3_column_int64(stmt, 2);
+                    const char* timeStr = (const char*)sqlite3_column_text(stmt, 3);
+
+                    BrowserDownloadEntry entry;
+                    entry.browserName = target.first;
+                    entry.targetPath = path ? path : "";
+                    entry.tabUrl = url ? url : "";
+                    
+                    char sizeBuf[32];
+                    if (bytes > 1024LL * 1024LL * 1024LL) {
+                        snprintf(sizeBuf, sizeof(sizeBuf), "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+                    } else if (bytes > 1024 * 1024) {
+                        snprintf(sizeBuf, sizeof(sizeBuf), "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+                    } else if (bytes > 0) {
+                        snprintf(sizeBuf, sizeof(sizeBuf), "%.2f KB", (double)bytes / 1024.0);
+                    } else {
+                        snprintf(sizeBuf, sizeof(sizeBuf), "N/A");
+                    }
+                    entry.receivedBytes = std::string(sizeBuf);
+                    entry.startTime = timeStr ? timeStr : "Unknown Date";
+
+                    downloads.push_back(entry);
+                }
+                sqlite3_finalize(stmt);
+            }
+            sqlite3_close(db);
+        }
+    }
+
+    if (appDataEnv != nullptr) {
+        std::string roamingApp(appDataEnv);
+        std::vector<std::string> firefoxProfileDirs = {
+            roamingApp + "\\Mozilla\\Firefox\\Profiles",
+            roamingApp + "\\Mozilla\\Firefox Nightly\\Profiles"
+        };
+
+        for (const auto& baseDir : firefoxProfileDirs) {
+            if (fs::exists(baseDir) && fs::is_directory(baseDir)) {
+                for (const auto& entry : fs::directory_iterator(baseDir)) {
+                    if (entry.is_directory()) {
+                        std::string placesFilePath = entry.path().string() + "\\places.sqlite";
+                        if (fs::exists(placesFilePath)) {
+                            sqlite3* db = nullptr;
+                            std::string uri = "file:" + placesFilePath + "?mode=ro";
+                            if (sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL) == SQLITE_OK) {
+                                std::string sql = 
+                                    "SELECT p.url, "
+                                    "MAX(CASE WHEN n.name = 'downloads/destinationFileURI' THEN a.content END) AS file_path, "
+                                    "MAX(CASE WHEN n.name = 'downloads/metaData' THEN a.content END) AS metadata, "
+                                    "datetime(MAX(a.lastModified) / 1000000, 'unixepoch', 'localtime') AS formatted_time "
+                                    "FROM moz_places p "
+                                    "JOIN moz_annos a ON p.id = a.place_id "
+                                    "JOIN moz_anno_attributes n ON a.anno_attribute_id = n.id "
+                                    "WHERE n.name IN ('downloads/destinationFileURI', 'downloads/metaData') "
+                                    "GROUP BY p.id, p.url "
+                                    "ORDER BY MAX(a.lastModified) DESC LIMIT 200;";
+                                
+                                sqlite3_stmt* stmt = nullptr;
+                                if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, NULL) == SQLITE_OK) {
+                                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                                        const char* url = (const char*)sqlite3_column_text(stmt, 0);
+                                        const char* rawPath = (const char*)sqlite3_column_text(stmt, 1);
+                                        const char* rawMeta = (const char*)sqlite3_column_text(stmt, 2);
+                                        const char* timeStr = (const char*)sqlite3_column_text(stmt, 3);
+
+                                        BrowserDownloadEntry dlEntry;
+                                        dlEntry.browserName = "Mozilla Firefox";
+                                        
+                                        std::string cleanPath = rawPath ? rawPath : "";
+                                        if (cleanPath.rfind("file:///", 0) == 0) {
+                                            cleanPath = cleanPath.substr(8);
+                                            std::replace(cleanPath.begin(), cleanPath.end(), '/', '\\');
+                                        }
+                                        dlEntry.targetPath = cleanPath;
+                                        dlEntry.tabUrl = url ? url : "";
+
+                                        sqlite3_int64 bytes = 0;
+                                        if (rawMeta) {
+                                            std::string metaStr(rawMeta);
+                                            size_t pos = metaStr.find("\"fileSize\":");
+                                            if (pos != std::string::npos) {
+                                                pos += 11;
+                                                bytes = std::stoll(metaStr.substr(pos));
+                                            }
+                                        }
+
+                                        char sizeBuf[32];
+                                        if (bytes > 1024LL * 1024LL * 1024LL) {
+                                            snprintf(sizeBuf, sizeof(sizeBuf), "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+                                        } else if (bytes > 1024 * 1024) {
+                                            snprintf(sizeBuf, sizeof(sizeBuf), "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+                                        } else if (bytes > 0) {
+                                            snprintf(sizeBuf, sizeof(sizeBuf), "%.2f KB", (double)bytes / 1024.0);
+                                        } else {
+                                            snprintf(sizeBuf, sizeof(sizeBuf), "N/A");
+                                        }
+
+                                        dlEntry.receivedBytes = std::string(sizeBuf);
+                                        dlEntry.startTime = timeStr ? timeStr : "Unknown Date";
+
+                                        downloads.push_back(dlEntry);
+                                    }
+                                    sqlite3_finalize(stmt);
+                                }
+                                sqlite3_close(db);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (localAppDataEnv) free(localAppDataEnv);
+    if (appDataEnv) free(appDataEnv);
+
+    return downloads;
 }
 
 std::vector<BrowserHistoryEntry> LoadBrowserHistory() {
     std::vector<BrowserHistoryEntry> entries;
-    char localAppData[MAX_PATH];
-    char roamingAppData[MAX_PATH];
-    
     historyStatusMsg = "Reading browsers...";
+    
+    char* localAppDataEnv = nullptr;
+    char* appDataEnv = nullptr;
+    size_t len1 = 0, len2 = 0;
 
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData))) {
-        ReadChromiumHistory(std::string(localAppData) + "\\Google\\Chrome\\User Data\\Default\\History", "Google Chrome", entries);
-        ReadChromiumHistory(std::string(localAppData) + "\\Microsoft\\Edge\\User Data\\Default\\History", "Microsoft Edge", entries);
-        ReadChromiumHistory(std::string(localAppData) + "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\History", "Brave Browser", entries);
+    _dupenv_s(&localAppDataEnv, &len1, "LOCALAPPDATA");
+    _dupenv_s(&appDataEnv, &len2, "APPDATA");
+
+    if (localAppDataEnv != nullptr) {
+        std::string localApp(localAppDataEnv);
+        ReadChromiumHistory(localApp + "\\Google\\Chrome\\User Data\\Default\\History", "Google Chrome", entries);
+        ReadChromiumHistory(localApp + "\\Google\\Chrome\\User Data\\Profile 1\\History", "Google Chrome", entries);    
+        ReadChromiumHistory(localApp + "\\Microsoft\\Edge\\User Data\\Default\\History", "Microsoft Edge", entries);        
+        ReadChromiumHistory(localApp + "\\BraveSoftware\\Brave-Browser\\User Data\\Default\\History", "Brave Browser", entries);
+        ReadChromiumHistory(localApp + "\\BraveSoftware\\Brave-Browser\\User Data\\Profile 1\\History", "Brave Browser", entries);
     }
-    
-    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, roamingAppData))) {
-        std::string roamingProfiles = std::string(roamingAppData) + "\\Mozilla\\Firefox\\Profiles\\";
+
+    if (appDataEnv != nullptr) {
+        std::string roamingApp(appDataEnv);
+        std::string roamingProfiles = roamingApp + "\\Mozilla\\Firefox\\Profiles\\";        
+        historyStatusMsg = "Scanning Firefox profiles...";
         ReadMozillaHistory(roamingProfiles, entries);
+    } else {
+        historyStatusMsg = "Error: APPDATA environment variable not found!";
     }
-    
+
+    if (appDataEnv) free(appDataEnv);
+    if (localAppDataEnv) free(localAppDataEnv);
+
+    std::sort(entries.begin(), entries.end(), [](const BrowserHistoryEntry& a, const BrowserHistoryEntry& b) {
+        return a.timestamp > b.timestamp;
+    });
+
     historyStatusMsg = "Loading complete!";
     return entries;
 }
@@ -4481,6 +5093,7 @@ std::vector<ProcessInfo> GetRunningProcesses() {
             info.cpuUsage = 0.0f;
             info.priorityStr = "Normal";
             info.isParentSpoofed = false;
+            info.isSigned = false;
 
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
             if (hProcess) {
@@ -4499,6 +5112,11 @@ std::vector<ProcessInfo> GetRunningProcesses() {
                 DWORD pathSize = MAX_PATH;
                 if (QueryFullProcessImageNameA(hProcess, 0, pathBuf, &pathSize)) {
                     info.exePath = pathBuf;
+                    
+                    std::lock_guard<std::mutex> lock(g_SignatureMutex);
+                    if (g_SignatureCache.find(info.exePath) != g_SignatureCache.end()) {
+                        info.isSigned = g_SignatureCache[info.exePath];
+                    }
                 }
 
                 PROCESS_MEMORY_COUNTERS pmc;
@@ -4597,6 +5215,18 @@ std::vector<ProcessInfo> GetRunningProcesses() {
         if (activePids.find(it->first) == activePids.end()) it = g_ProcessHistory.erase(it);
         else ++it;
     }
+
+    std::thread([](std::vector<ProcessInfo> procs) {
+        for (const auto& p : procs) {
+            if (p.exePath != "N/A" && !p.exePath.empty()) {
+                std::lock_guard<std::mutex> lock(g_SignatureMutex);
+                if (g_SignatureCache.find(p.exePath) == g_SignatureCache.end()) {
+                    SignatureDetails sig = CheckFileDigitalSignature(p.exePath);
+                    g_SignatureCache[p.exePath] = sig.isSigned;
+                }
+            }
+        }
+    }, flatProcesses).detach();
 
     std::unordered_map<DWORD, ProcessInfo> processMap;
     for (const auto& p : flatProcesses) {
@@ -4883,6 +5513,170 @@ bool IsProcessX64(DWORD pid) {
         #endif
     }
     return false;
+}
+
+void ExportForensicReportToHTML(const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) return;
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm timeinfo;
+    localtime_s(&timeinfo, &now_c);
+    std::ostringstream timeSs;
+    timeSs << std::put_time(&timeinfo, "%Y-%m-%d %H:%M:%S");
+
+    std::vector<ProcessInfo> currentProcs = GetRunningProcesses();
+
+    file << "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
+    file << "<meta charset=\"UTF-8\">\n<title>Forensic Task Manager - Enterprise Audit Report</title>\n";
+    file << "<style>\n";
+    file << "body { background-color: #0d0d11; color: #e0e0e6; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 30px; }\n";
+    file << "h1 { color: #ffffff; font-size: 26px; margin-bottom: 5px; }\n";
+    file << "p.subtitle { color: #8a8a9d; font-size: 14px; margin-top: 0; margin-bottom: 25px; }\n";
+    file << "h2 { color: #7289da; font-size: 18px; border-bottom: 1px solid #2a2a35; padding-bottom: 6px; margin-top: 0; }\n";
+    file << ".card { background: rgba(25, 25, 35, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 10px; padding: 20px; margin-bottom: 25px; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37); }\n";
+    file << "table { width: 100%; border-collapse: collapse; margin-top: 10px; table-layout: fixed; }\n";
+    file << "th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #23232d; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }\n";
+    file << "th { background-color: #16161f; color: #a0aec0; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }\n";
+    file << "tr:hover { background-color: rgba(255, 255, 255, 0.02); }\n";
+    file << ".badge { background-color: #1f3a2c; color: #43b581; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }\n";
+    file << ".badge-warn { background-color: #3a221f; color: #f04747; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }\n";
+    file << ".badge-info { background-color: #222a3a; color: #7289da; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }\n";
+    file << ".grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }\n";
+    file << ".stats-grid { display: flex; gap: 15px; margin-bottom: 25px; }\n";
+    file << ".stat-box { background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 6px; padding: 15px; flex: 1; text-align: center; }\n";
+    file << ".stat-val { font-size: 20px; font-weight: bold; color: #ffffff; margin-top: 5px; }\n";
+    file << ".break-url { word-break: break-all; overflow-wrap: break-word; }\n";
+    file << "</style>\n</head>\n<body>\n";
+
+    file << "<h1>Forensic Task Manager</h1>\n";
+    file << "<p class=\"subtitle\">Consolidated Forensic Report &bull; Generated on " << timeSs.str();
+
+    file << "<div class=\"stats-grid\">\n";
+    file << "<div class=\"stat-box\"><div>Cached Processes</div><div class=\"stat-val\">" << currentProcs.size() << "</div></div>\n";
+    file << "<div class=\"stat-box\"><div>Active Connections</div><div class=\"stat-val\">" << cachedNetConnections.size() << "</div></div>\n";
+    file << "<div class=\"stat-box\"><div>Loaded Drivers</div><div class=\"stat-val\">" << cachedDrivers.size() << "</div></div>\n";
+    file << "<div class=\"stat-box\"><div>USB Artifacts</div><div class=\"stat-val\">" << cachedUSBHistory.size() << "</div></div>\n";
+    file << "</div>\n";
+
+    file << "<div class=\"card\">\n";
+    file << "<h2>1. System & Hardware Information</h2>\n";
+    file << "<div class=\"grid-2\">\n";
+    file << "<p><strong>OS Version:</strong> " << cachedHardware.osVersion << "</p>\n";
+    file << "<p><strong>CPU:</strong> " << cachedHardware.cpuName << "</p>\n";
+    file << "<p><strong>Total RAM:</strong> " << cachedHardware.totalRam << "</p>\n";
+    file << "<p><strong>GPU:</strong> " << cachedHardware.gpuName << "</p>\n";
+    file << "<p><strong>Motherboard:</strong> " << cachedHardware.motherBoard << "</p>\n";
+    file << "</div>\n</div>\n";
+
+    file << "<div class=\"card\">\n";
+    file << "<h2>2. Active Processes (Spoofing Analysis)</h2>\n";
+    file << "<table>\n";
+    file << "<tr><th style=\"width:8%\">PID</th><th style=\"width:8%\">PPID</th><th style=\"width:20%\">Name</th><th style=\"width:44%\">Executable Path</th><th style=\"width:20%\">Status / Spoofing</th></tr>\n";
+    for (const auto& p : currentProcs) {
+        std::string statusBadge = p.isParentSpoofed ? 
+            "<span class=\"badge-warn\">Spoofing: " + p.spoofingReason + "</span>" : 
+            "<span class=\"badge\">Normal</span>";
+
+        file << "<tr>"
+             << "<td>" << p.pid << "</td>"
+             << "<td>" << p.parentPid << "</td>"
+             << "<td><strong>" << p.name << "</strong></td>"
+             << "<td style=\"font-family:monospace; color:#a0aec0;\" class=\"break-url\">" << p.exePath << "</td>"
+             << "<td>" << statusBadge << "</td>"
+             << "</tr>\n";
+    }
+    file << "</table>\n</div>\n";
+
+    file << "<div class=\"card\">\n";
+    file << "<h2>3. Active TCP Network Connections & Geolocation</h2>\n";
+    file << "<table>\n";
+    file << "<tr><th style=\"width:8%\">Proto</th><th style=\"width:18%\">Local</th><th style=\"width:18%\">Remote</th><th style=\"width:12%\">State</th><th style=\"width:6%\">PID</th><th style=\"width:18%\">Process</th><th style=\"width:20%\">Geolocation & ISP</th></tr>\n";
+    for (const auto& conn : cachedNetConnections) {
+        std::string geo = GetCachedGeo(conn.remoteIp);
+        if (geo.empty()) geo = "Local / Not Queried";
+
+        file << "<tr>"
+             << "<td>" << conn.protocol << "</td>"
+             << "<td>" << conn.localIp << ":" << conn.localPort << "</td>"
+             << "<td>" << conn.remoteIp << ":" << conn.remotePort << "</td>"
+             << "<td><span class=\"badge-info\">" << conn.state << "</span></td>"
+             << "<td>" << conn.pid << "</td>"
+             << "<td>" << conn.processName << "</td>"
+             << "<td>" << geo << "</td>"
+             << "</tr>\n";
+    }
+    file << "</table>\n</div>\n";
+
+    if (!cachedDrivers.empty()) {
+        file << "<div class=\"card\">\n";
+        file << "<h2>4. Kernel Drivers</h2>\n";
+        file << "<table>\n";
+        file << "<tr><th style=\"width:25%\">Name</th><th style=\"width:55%\">Path</th><th style=\"width:20%\">Digital Signature</th></tr>\n";
+        for (const auto& d : cachedDrivers) {
+            std::string signBadge = d.isSigned ? "<span class=\"badge\">Signed</span>" : "<span class=\"badge-warn\">Unsigned / Unknown</span>";
+            file << "<tr>"
+                 << "<td><strong>" << d.name << "</strong></td>"
+                 << "<td style=\"font-family:monospace; color:#a0aec0;\" class=\"break-url\">" << d.path << "</td>"
+                 << "<td>" << signBadge << "</td>"
+                 << "</tr>\n";
+        }
+        file << "</table>\n</div>\n";
+    }
+
+    if (!cachedUSBHistory.empty()) {
+        file << "<div class=\"card\">\n";
+        file << "<h2>5. Connected USB Devices History</h2>\n";
+        file << "<table>\n";
+        file << "<tr><th style=\"width:25%\">Device</th><th style=\"width:25%\">Friendly Name</th><th style=\"width:30%\">Serial Number</th><th style=\"width:20%\">Install Date</th></tr>\n";
+        for (const auto& usb : cachedUSBHistory) {
+            file << "<tr>"
+                 << "<td>" << usb.deviceName << "</td>"
+                 << "<td><strong>" << usb.friendlyName << "</strong></td>"
+                 << "<td style=\"font-family:monospace;\" class=\"break-url\">" << usb.serialNumber << "</td>"
+                 << "<td>" << usb.installDate << "</td>"
+                 << "</tr>\n";
+        }
+        file << "</table>\n</div>\n";
+    }
+
+    if (!cachedBrowserHistory.empty()) {
+        file << "<div class=\"card\">\n";
+        file << "<h2>6. Recent Browser History</h2>\n";
+        file << "<table>\n";
+        file << "<tr><th style=\"width:15%\">Browser</th><th style=\"width:30%\">Title</th><th style=\"width:40%\">URL</th><th style=\"width:15%\">Timestamp</th></tr>\n";
+        size_t limit = 0;
+        for (const auto& bh : cachedBrowserHistory) {
+            if (limit++ > 100) break;
+            file << "<tr>"
+                 << "<td><span class=\"badge-info\">" << bh.browserName << "</span></td>"
+                 << "<td>" << bh.title << "</td>"
+                 << "<td class=\"break-url\" style=\"font-family:monospace;\"><a href=\"" << bh.url << "\" target=\"_blank\" style=\"color: #7289da;\">" << bh.url << "</a></td>"
+                 << "<td>" << bh.timestamp << "</td>"
+                 << "</tr>\n";
+        }
+        file << "</table>\n</div>\n";
+    }
+
+    if (!pfCachedItems.empty()) {
+        file << "<div class=\"card\">\n";
+        file << "<h2>7. Prefetch Analysis (Recorded Executions)</h2>\n";
+        file << "<table>\n";
+        file << "<tr><th style=\"width:25%\">Executable</th><th style=\"width:15%\">Run Count</th><th style=\"width:20%\">Last Run Time</th><th style=\"width:40%\">Path</th></tr>\n";
+        for (const auto& pf : pfCachedItems) {
+            file << "<tr>"
+                 << "<td><strong>" << pf.executableName << "</strong></td>"
+                 << "<td>" << pf.runCount << "</td>"
+                 << "<td>" << pf.lastRunTime << "</td>"
+                 << "<td style=\"font-family:monospace; color:#a0aec0;\" class=\"break-url\">" << pf.filePath << "</td>"
+                 << "</tr>\n";
+        }
+        file << "</table>\n</div>\n";
+    }
+
+    file << "</body>\n</html>";
+    file.close();
 }
 
 void RenderProcessDetailsModal(bool& isOpen, const ProcessInfo& p) {
@@ -5382,18 +6176,27 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     } else {
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "OK");
     }
+
+    ImGui::TableSetColumnIndex(6);
+    if (p.exePath == "N/A" || p.exePath.empty()) {
+        ImGui::TextDisabled("N/A");
+    } else if (p.isSigned) {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Signed");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Unsigned");
+    }
     
-    ImGui::TableSetColumnIndex(6); 
+    ImGui::TableSetColumnIndex(7); 
     ImGui::Text("%s", p.exePath.c_str());
 
     if (isOpen) {
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                               modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                               connectionsPid, showConnections, cachedConnections, connectionsError,
-                               handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
-                               cachedProcesses,
-                               monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
+                                 modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                                 connectionsPid, showConnections, cachedConnections, connectionsError,
+                                 handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                                 cachedProcesses,
+                                 monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
@@ -6597,6 +7400,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 if (ImGui::MenuItem("Live Boot Media Builder...")) {
                     showLiveBootModal = true;
                 }
+                if (ImGui::MenuItem("Generate HTML Report")) {
+                    auto now = std::chrono::system_clock::now();
+                    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+                    std::tm timeinfo;
+                    localtime_s(&timeinfo, &now_c);
+
+                    std::ostringstream ss;
+                    ss << "Forensic_Report_" << std::put_time(&timeinfo, "%Y-%m-%d_%H-%M-%S") << ".html";
+                    
+                    ExportForensicReportToHTML(ss.str());
+                }
                 if (ImGui::MenuItem("Forensic Report Viewer...")) {
                     showReportViewerModal = true;
                 }
@@ -6668,7 +7482,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             sprintf_s(cpuBuffer, "CPU: %.1f%%", cachedCpu);
             std::string cpuUsageStr = cpuBuffer;
 
-            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.4 Release";
+            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.5 Release";
             float textWidth = ImGui::CalcTextSize(statusText.c_str()).x;
             float availableWidth = ImGui::GetContentRegionAvail().x;
             if (availableWidth > textWidth) {
@@ -6691,7 +7505,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             "Event Logs", "Artifact Scanner", "Network Connections", "Installed Apps", 
             "Windows Services", "Scheduled Tasks", "DLL Dependency Viewer", 
             "Startup Applications", "Environment Variables", "Locked Handles", 
-            "Dump Analyzer", "Live Tracker", "Tech Toolbox", "Hardware Specs"
+            "Dump Analyzer", "Live Tracker", "Tech Toolbox", "Hardware Specs", "Logon Sessions"
         };
 
         if (!showSidebar) {
@@ -6766,7 +7580,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Spacing();
 
             ImGui::TextDisabled("SYSTEM & NETWORK");
-            int systemTabs[] = { 14, 15, 16, 17, 18, 19, 20, 21 };
+            int systemTabs[] = { 26, 14, 15, 16, 17, 18, 19, 20, 21};
             for (int idx : systemTabs) {
                 if (ImGui::Selectable(tabNames[idx], currentTab == idx)) {
                     currentTab = idx;
@@ -7172,7 +7986,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                 if (ImGui::BeginChild("PerfDetailPanel", ImVec2(mainPanelWidth, contentHeight), true)) {
                     
-                    auto drawLargeDashboard = [&](const char* title, std::deque<float>& data, float scaleMax, const char* unit, bool autoScale, const char* specsText) {
+                    auto drawLargeDashboard = [&](const char* title, std::deque<float>& data, float scaleMax, const char* unit, bool autoScale, const char* specsText = "") {
                         ImGui::TextColored(themes[currentThemeIndex].accentColor, "%s", title);
                         ImGui::Separator();
                         ImGui::Spacing();
@@ -7224,14 +8038,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             ImGui::TextDisabled("Waiting for telemetry data...");
                         }
 
-                        ImGui::Spacing();
-                        ImGui::Separator();
-                        ImGui::Spacing();
+                        if (specsText != nullptr && specsText[0] != '\0') {
+                            ImGui::Spacing();
+                            ImGui::Separator();
+                            ImGui::Spacing();
 
-                        ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ HARDWARE SPECIFICATIONS & DETAILS ]");
-                        ImGui::BeginChild("SpecsScrollBox", ImVec2(0, 0), true);
-                        ImGui::TextWrapped("%s", specsText);
-                        ImGui::EndChild();
+                            ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ HARDWARE SPECIFICATIONS & DETAILS ]");
+                            ImGui::BeginChild("SpecsScrollBox", ImVec2(0, 0), true);
+                            ImGui::TextWrapped("%s", specsText);
+                            ImGui::EndChild();
+                        }
                     };
 
                     switch (selectedPerfCategory) {
@@ -7259,62 +8075,195 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             ImGui::Separator();
                             ImGui::Spacing();
 
-                            if (cpuViewMode == 0) {
-                                static std::string cachedCpuName = "";
-                                if (cachedCpuName.empty()) {
-                                    char cpuBrand[0x40] = { 0 };
-                                    int cpuInfo[4] = { 0 };
-                                    
-                                    __cpuid(cpuInfo, 0x80000000);
-                                    if (cpuInfo[0] >= (int)0x80000004) {
-                                        __cpuid((int*)(cpuBrand + 0), 0x80000002);
-                                        __cpuid((int*)(cpuBrand + 16), 0x80000003);
-                                        __cpuid((int*)(cpuBrand + 32), 0x80000004);
-                                        cachedCpuName = std::string(cpuBrand);
-                                        cachedCpuName.erase(cachedCpuName.find_last_not_of(" \n\r\t") + 1);
-                                    }
-                                    if (cachedCpuName.empty()) {
-                                        cachedCpuName = "Modern x64 Architecture";
-                                    }
+                            static std::string cachedCpuName = "";
+                            if (cachedCpuName.empty()) {
+                                char cpuBrand[0x40] = { 0 };
+                                int cpuInfo[4] = { 0 };
+                                __cpuid(cpuInfo, 0x80000000);
+                                if (cpuInfo[0] >= (int)0x80000004) {
+                                    __cpuid((int*)(cpuBrand + 0), 0x80000002);
+                                    __cpuid((int*)(cpuBrand + 16), 0x80000003);
+                                    __cpuid((int*)(cpuBrand + 32), 0x80000004);
+                                    cachedCpuName = std::string(cpuBrand);
+                                    cachedCpuName.erase(cachedCpuName.find_last_not_of(" \n\r\t") + 1);
                                 }
-
-                                std::string cpuSpecs = "Processor: " + cachedCpuName +
-                                                        "\nLogical Cores: " + std::to_string(g_PerfHistory.perCoreCpuHistory.size()) + 
-                                                        "\nStatus: Running at optimal frequency.\nTelemetry source: Windows Performance Counters / PDH.";
-                                                        
-                                drawLargeDashboard("CENTRAL PROCESSING UNIT (GLOBAL)", g_PerfHistory.cpuHistory, 100.0f, "%", false, cpuSpecs.c_str());
+                                if (cachedCpuName.empty()) {
+                                    cachedCpuName = "Modern x64 Architecture";
+                                }
                             }
-                            else if (cpuViewMode == 1) {
-                                ImGui::TextColored(themes[currentThemeIndex].accentColor, "[ ALL LOGICAL CORES OVERVIEW ]");
-                                ImGui::Separator();
-                                if (ImGui::BeginChild("AllCoresGridScroll", ImVec2(0, 0), true)) {
-                                    int columns = 4;
-                                    ImGui::Columns(columns, "CoresGridCols", false);
-                                    for (size_t i = 0; i < g_PerfHistory.perCoreCpuHistory.size(); ++i) {
-                                        float cVal = g_PerfHistory.perCoreCpuHistory[i].empty() ? 0.0f : g_PerfHistory.perCoreCpuHistory[i].back();
-                                        char boxTitle[32];
-                                        snprintf(boxTitle, sizeof(boxTitle), "Core %zu (%.1f%%)", i, cVal);
+
+                            unsigned long totalProcesses = 0;
+                            unsigned long totalThreads = 0;
+                            unsigned long totalHandles = 0;
+
+                            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                            if (hSnapshot != INVALID_HANDLE_VALUE) {
+                                PROCESSENTRY32W pe32;
+                                pe32.dwSize = sizeof(PROCESSENTRY32W);
+                                if (Process32FirstW(hSnapshot, &pe32)) {
+                                    do {
+                                        totalProcesses++;
+                                        totalThreads += pe32.cntThreads;
                                         
-                                        ImGui::BeginChild(boxTitle, ImVec2(0, 95), true);
-                                        ImGui::Text("%s", boxTitle);
-                                        std::vector<float> corePlot(g_PerfHistory.perCoreCpuHistory[i].begin(), g_PerfHistory.perCoreCpuHistory[i].end());
-                                        if (!corePlot.empty()) {
-                                            ImGui::PlotLines("##CorePlot", corePlot.data(), (int)corePlot.size(), 0, NULL, 0.0f, 100.0f, ImVec2(-1, 45));
+                                        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe32.th32ProcessID);
+                                        if (hProc) {
+                                            DWORD handleCount = 0;
+                                            if (GetProcessHandleCount(hProc, &handleCount)) {
+                                                totalHandles += handleCount;
+                                            }
+                                            CloseHandle(hProc);
                                         }
-                                        ImGui::EndChild();
-                                        ImGui::NextColumn();
+                                    } while (Process32NextW(hSnapshot, &pe32));
+                                }
+                                CloseHandle(hSnapshot);
+                            }
+
+                            ULONGLONG tickCount = GetTickCount64();
+                            unsigned long seconds = (unsigned long)(tickCount / 1000);
+                            unsigned long hours = seconds / 3600;
+                            unsigned long minutes = (seconds % 3600) / 60;
+                            unsigned long secs = seconds % 60;
+                            unsigned long days = hours / 24;
+                            hours %= 24;
+
+                            char uptimeBuffer[64];
+                            if (days > 0) {
+                                snprintf(uptimeBuffer, sizeof(uptimeBuffer), "%lu days, %02lu:%02lu:%02lu", days, hours, minutes, secs);
+                            } else {
+                                snprintf(uptimeBuffer, sizeof(uptimeBuffer), "%02lu:%02lu:%02lu", hours, minutes, secs);
+                            }
+
+                            if (cpuViewMode == 0) {
+                                drawLargeDashboard("CENTRAL PROCESSING UNIT (GLOBAL)", g_PerfHistory.cpuHistory, 100.0f, "%", false);
+
+                                ImGui::Spacing();
+                                
+                                if (ImGui::BeginChild("CpuDetailsPanel", ImVec2(0, 155), true)) {
+                                    ImGui::TextColored(themes[currentThemeIndex].accentColor, "HARDWARE SPECIFICATIONS & DETAILS");
+                                    ImGui::Separator();
+                                    ImGui::Spacing();
+
+                                    if (ImGui::BeginTable("CpuDetailsTable", 3, ImGuiTableFlags_SizingStretchProp)) {
+                                        ImGui::TableNextColumn();
+                                        ImGui::TextDisabled("Processor:");
+                                        ImGui::Spacing();
+                                        ImGui::TextDisabled("Processes:");
+                                        ImGui::Spacing();
+                                        ImGui::TextDisabled("Sockets:");
+
+                                        ImGui::TableNextColumn();
+                                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s", cachedCpuName.c_str());
+                                        ImGui::Spacing();
+                                        ImGui::Text("%lu", totalProcesses);
+                                        ImGui::Spacing();
+                                        ImGui::Text("1");
+
+                                        ImGui::TableNextColumn();
+                                        ImGui::Text("Uptime: %s", uptimeBuffer);
+                                        ImGui::Spacing();
+                                        ImGui::Text("Threads: %lu   |   Handles: %lu", totalThreads, totalHandles);
+                                        ImGui::Spacing();
+                                        ImGui::Text("Cores: %zu   |   Logical: %zu   |   Virtualization: Enabled", 
+                                                    g_PerfHistory.perCoreCpuHistory.size() / 2, 
+                                                    g_PerfHistory.perCoreCpuHistory.size());
+
+                                        ImGui::EndTable();
                                     }
-                                    ImGui::Columns(1);
                                 }
                                 ImGui::EndChild();
-                            } 
+                            }
+                            else if (cpuViewMode == 1) {
+                                ImGui::Text("CPU");
+                                ImGui::SameLine();
+                                std::string cpuHeaderRight = cachedCpuName;
+                                float textWidth = ImGui::CalcTextSize(cpuHeaderRight.c_str()).x;
+                                ImGui::SetCursorPosX(ImGui::GetWindowWidth() - textWidth - 20.0f);
+                                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", cpuHeaderRight.c_str());
+
+                                ImGui::TextDisabled("%% for use for 60 seconds");
+                                ImGui::Separator();
+                                ImGui::Spacing();
+
+                                float gridHeight = contentHeight - 210.0f;
+                                if (gridHeight < 200.0f) gridHeight = 200.0f;
+
+                                if (ImGui::BeginChild("AllCoresGridScroll", ImVec2(0, gridHeight), false)) {
+                                    int numColumns = 4;
+                                    if (ImGui::BeginTable("CpuCoresGridTable", numColumns, ImGuiTableFlags_BordersInner | ImGuiTableFlags_SizingStretchProp)) {
+                                        
+                                        for (size_t i = 0; i < g_PerfHistory.perCoreCpuHistory.size(); ++i) {
+                                            ImGui::TableNextColumn();
+
+                                            float cVal = g_PerfHistory.perCoreCpuHistory[i].empty() ? 0.0f : g_PerfHistory.perCoreCpuHistory[i].back();
+                                            
+                                            char coreLabel[32];
+                                            snprintf(coreLabel, sizeof(coreLabel), "CPU %zu", i);
+                                            ImGui::TextDisabled("%s", coreLabel);
+                                            
+                                            ImGui::SameLine();
+                                            char pctStr[16];
+                                            snprintf(pctStr, sizeof(pctStr), "%.1f%%", cVal);
+                                            float pctWidth = ImGui::CalcTextSize(pctStr).x;
+                                            
+                                            float currentColumnWidth = ImGui::GetColumnWidth();
+                                            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + currentColumnWidth - pctWidth - 25.0f);
+                                            ImGui::TextColored(themes[currentThemeIndex].accentColor, "%s", pctStr);
+
+                                            std::vector<float> corePlot(g_PerfHistory.perCoreCpuHistory[i].begin(), g_PerfHistory.perCoreCpuHistory[i].end());
+                                            if (!corePlot.empty()) {
+                                                char plotId[32];
+                                                snprintf(plotId, sizeof(plotId), "##CorePlot_%zu", i);
+                                                ImGui::PlotLines(plotId, corePlot.data(), (int)corePlot.size(), 0, NULL, 0.0f, 100.0f, ImVec2(-1, 55));
+                                            } else {
+                                                ImGui::Dummy(ImVec2(-1, 55));
+                                            }
+
+                                            ImGui::Spacing();
+                                        }
+
+                                        ImGui::EndTable();
+                                    }
+                                }
+                                ImGui::EndChild();
+
+                                ImGui::Spacing();
+
+                                if (ImGui::BeginChild("CpuDetailsPanelGrid", ImVec2(0, 155), true)) {
+                                    ImGui::TextColored(themes[currentThemeIndex].accentColor, "HARDWARE SPECIFICATIONS & DETAILS");
+                                    ImGui::Separator();
+                                    ImGui::Spacing();
+
+                                    if (ImGui::BeginTable("CpuDetailsTableGrid", 3, ImGuiTableFlags_SizingStretchProp)) {
+                                        ImGui::TableNextColumn();
+                                        ImGui::TextDisabled("Processes:");
+                                        ImGui::Spacing();
+                                        ImGui::TextDisabled("Sockets:");
+
+                                        ImGui::TableNextColumn();         
+                                        ImGui::Text("%lu", totalProcesses);
+                                        ImGui::Spacing();
+                                        ImGui::Text("1");
+
+                                        ImGui::TableNextColumn();
+                                        ImGui::Text("Uptime: %s", uptimeBuffer);
+                                        ImGui::Spacing();
+                                        ImGui::Text("Threads: %lu   |   Handles: %lu", totalThreads, totalHandles);
+                                        ImGui::Spacing();
+                                        ImGui::Text("Cores: %zu   |   Logical: %zu   |   Virtualization: Enabled", 
+                                                    g_PerfHistory.perCoreCpuHistory.size() / 2, 
+                                                    g_PerfHistory.perCoreCpuHistory.size());
+
+                                        ImGui::EndTable();
+                                    }
+                                }
+                                ImGui::EndChild();
+                            }
                             else {
                                 int coreIdx = cpuViewMode - 2;
                                 if ((size_t)coreIdx < g_PerfHistory.perCoreCpuHistory.size()) {
                                     char title[64];
                                     snprintf(title, sizeof(title), "CPU CORE %d TELEMETRY", coreIdx);
-                                    std::string coreSpecs = "Logical Core Index: " + std::to_string(coreIdx) + "\nArchitecture: SMT / Hyper-Threading Enabled core.";
-                                    drawLargeDashboard(title, g_PerfHistory.perCoreCpuHistory[coreIdx], 100.0f, "%", false, coreSpecs.c_str());
+                                    drawLargeDashboard(title, g_PerfHistory.perCoreCpuHistory[coreIdx], 100.0f, "%", false);
                                 }
                             }
                             break;
@@ -7325,17 +8274,68 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             memInfo.dwLength = sizeof(MEMORYSTATUSEX);
                             
                             std::string ramSizeStr = "Unknown";
+                            std::string ramAvailableStr = "Unknown";
+                            std::string ramCommitStr = "Unknown";
+                            
                             if (GlobalMemoryStatusEx(&memInfo)) {
                                 double totalRamGB = (double)memInfo.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+                                double availRamGB = (double)memInfo.ullAvailPhys / (1024.0 * 1024.0 * 1024.0);
+                                double totalCommitGB = (double)memInfo.ullTotalPageFile / (1024.0 * 1024.0 * 1024.0);
+                                double availCommitGB = (double)memInfo.ullAvailPageFile / (1024.0 * 1024.0 * 1024.0);
+
                                 char buf[32];
-                                snprintf(buf, sizeof(buf), "%.1f GB", totalRamGB);
+                                snprintf(buf, sizeof(buf), "%.2f GB", totalRamGB);
                                 ramSizeStr = std::string(buf);
+
+                                snprintf(buf, sizeof(buf), "%.2f GB", availRamGB);
+                                ramAvailableStr = std::string(buf);
+
+                                snprintf(buf, sizeof(buf), "%.1f / %.1f GB", (totalCommitGB - availCommitGB), totalCommitGB);
+                                ramCommitStr = std::string(buf);
                             }
 
-                            std::string ramSpecs = "Type: Physical System RAM\nTotal Physical Memory: " + ramSizeStr + 
-                                                    "\nMonitoring: Global commit charge & physical memory usage.\nStatus: Stable memory pool allocation.";
-                                                    
-                            drawLargeDashboard("SYSTEM MEMORY (RAM)", g_PerfHistory.ramHistory, 100.0f, "%", false, ramSpecs.c_str());
+                            drawLargeDashboard("SYSTEM MEMORY (RAM)", g_PerfHistory.ramHistory, 100.0f, "%", false);
+
+                            ImGui::Spacing();
+
+                            if (ImGui::BeginChild("RamDetailsPanel", ImVec2(0, 190), true)) {
+                                ImGui::TextColored(themes[currentThemeIndex].accentColor, "MEMORY SPECIFICATIONS & DETAILS");
+                                ImGui::Separator();
+                                ImGui::Spacing();
+                                ImGui::Spacing();
+
+                                if (ImGui::BeginTable("RamDetailsTable", 3, ImGuiTableFlags_SizingStretchProp)) {
+                                    ImGui::TableNextColumn();
+                                    ImGui::TextDisabled("Total Memory:");
+                                    ImGui::Spacing();
+                                    ImGui::Spacing();
+                                    ImGui::TextDisabled("Available RAM:");
+                                    ImGui::Spacing();
+                                    ImGui::Spacing();
+                                    ImGui::TextDisabled("Memory Type:");
+
+                                    ImGui::TableNextColumn();
+                                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s", ramSizeStr.c_str());
+                                    ImGui::Spacing();
+                                    ImGui::Spacing();
+                                    ImGui::Text("%s", ramAvailableStr.c_str());
+                                    ImGui::Spacing();
+                                    ImGui::Spacing();
+                                    ImGui::Text("Physical RAM (DDR4/DDR5)");
+
+                                    ImGui::TableNextColumn();
+                                    ImGui::Text("Commit Limit / In Use: %s", ramCommitStr.c_str());
+                                    ImGui::Spacing();
+                                    ImGui::Spacing();
+                                    ImGui::Text("Form Factor: DIMM / On-Board");
+                                    ImGui::Spacing();
+                                    ImGui::Spacing();
+                                    ImGui::Text("Channels: Active Multi-Channel");
+
+                                    ImGui::EndTable();
+                                }
+                            }
+                            ImGui::EndChild();
                             break;
                         }
                         case 2:
@@ -7778,13 +8778,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::Spacing();
                 float tableHeight = (float)winHeight - 190.0f;
 
-                if (ImGui::BeginTable("ProcessTable", 7, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
+                if (ImGui::BeginTable("ProcessTable", 8, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
                     ImGui::TableSetupColumn("NAME", ImGuiTableColumnFlags_WidthStretch, 2.0f);
                     ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("CPU (%)", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("MEMORY (MB)", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                     ImGui::TableSetupColumn("PRIORITY", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                     ImGui::TableSetupColumn("STATUS / SPOOFING", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                    ImGui::TableSetupColumn("SIGNATURE", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                     ImGui::TableSetupColumn("PATH", ImGuiTableColumnFlags_WidthStretch, 3.0f);
                     ImGui::TableHeadersRow();
 
@@ -8793,6 +9794,86 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                 ImGui::EndTabItem();
             }
+
+            // TAB LOGON SESSION
+            if (ImGui::BeginTabItem("Logon Sessions", NULL, (currentTab == 26 ? itemFlags : 0))) {
+                ImGui::Text("Active Logon Sessions & Remote Access Audit");
+                ImGui::SameLine();
+                if (ImGui::Button("Refresh Logon Sessions")) {
+                    logonSessionsInitialized = false; 
+                }
+                
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                if (!logonSessionsInitialized) {
+                    cachedLogonSessions = GetActiveLogonSessions();
+                    logonSessionsInitialized = true;
+                }
+
+                float contentHeight = (float)winHeight - 180.0f;
+                if (ImGui::BeginChild("LogonSessionsCardsScroll", ImVec2(0, contentHeight), true, 0)) {
+                    
+                    auto DrawCard = [](const char* title, const ImVec4& accentColor, auto renderContent) {
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.15f, 0.18f, 0.6f));
+                        
+                        ImGuiChildFlags childFlags = ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysAutoResize | ImGuiChildFlags_AutoResizeY;
+                        ImGui::BeginChild(title, ImVec2(0, 0), childFlags, ImGuiWindowFlags_NoScrollbar);
+                        
+                        ImGui::TextColored(accentColor, "%s", title);
+                        ImGui::Separator();
+                        ImGui::Spacing();
+
+                        renderContent();
+
+                        ImGui::EndChild();
+                        ImGui::PopStyleColor();
+                        ImGui::Spacing();
+                    };
+
+                    DrawCard("Logon Summary Overview", ImVec4(0.3f, 0.7f, 1.0f, 1.0f), [&]() {
+                        ImGui::Text("Total Active Sessions Detected: %zu", cachedLogonSessions.sessions.size());
+                        ImGui::BulletText("Interactive Console Sessions: %d", cachedLogonSessions.interactiveCount);
+                        ImGui::BulletText("Remote Interactive (RDP) Sessions: %d", cachedLogonSessions.remoteRdpCount);
+                        ImGui::BulletText("Network Sessions: %d", cachedLogonSessions.networkCount);
+                        ImGui::BulletText("Service Sessions: %d", cachedLogonSessions.serviceCount);
+                    });
+
+                    DrawCard("Active Logon Sessions Details", ImVec4(0.2f, 0.8f, 0.4f, 1.0f), [&]() {
+                        if (cachedLogonSessions.sessions.empty()) {
+                            ImGui::Text("No active logon sessions found or insufficient privileges.");
+                        } else {
+                            for (size_t i = 0; i < cachedLogonSessions.sessions.size(); ++i) {
+                                const auto& s = cachedLogonSessions.sessions[i];
+                                
+                                bool isRdp = (s.logonTypeStr.find("RDP") != std::string::npos);
+                                if (isRdp) {
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                                }
+
+                                ImGui::BulletText("[%s] User: %s\\%s", s.logonTypeStr.c_str(), s.domain.c_str(), s.username.c_str());
+                                
+                                if (isRdp) {
+                                    ImGui::PopStyleColor();
+                                }
+
+                                ImGui::Indent(20.0f);
+                                ImGui::Text("Logon Time: %s", s.logonTime.c_str());
+                                ImGui::Text("Logon ID: 0x%X:%X", s.logonIdHigh, s.logonIdLow);
+                                if (!s.logonServer.empty() && s.logonServer != "-") {
+                                    ImGui::Text("Origin / Server: %s", s.logonServer.c_str());
+                                }
+                                ImGui::Unindent(20.0f);
+                                ImGui::Spacing();
+                            }
+                        }
+                    });
+
+                }
+                ImGui::EndChild();
+
+                ImGui::EndTabItem();
+            }
             
             // TAB NETWORK CONNECTIONS
             if (ImGui::BeginTabItem("Network Connections", NULL, (currentTab == 14 ? itemFlags : 0))) {
@@ -8992,13 +10073,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                         ImGui::Spacing();
 
                         float tableHeight = (float)winHeight - 240.0f;
-                        if (ImGui::BeginTable("NetTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, tableHeight))) {
-                            ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                            ImGui::TableSetupColumn("Local Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                            ImGui::TableSetupColumn("Remote Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                            ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-                            ImGui::TableSetupColumn("Process / PID", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        if (ImGui::BeginTable("NetTable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, tableHeight))) {
+                            ImGui::TableSetupColumn("Proto", ImGuiTableColumnFlags_WidthFixed, 45.0f);
+                            ImGui::TableSetupColumn("Local Address", ImGuiTableColumnFlags_WidthFixed, 135.0f);
+                            ImGui::TableSetupColumn("Remote Address", ImGuiTableColumnFlags_WidthFixed, 135.0f);
+                            ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 95.0f);
+                            ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                            ImGui::TableSetupColumn("Geo Location & WHOIS / ISP", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                            ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 65.0f);
                             ImGui::TableHeadersRow();
 
                             std::string filterStr = netSearchBuffer;
@@ -9033,10 +10115,22 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                 }
 
                                 ImGui::TableSetColumnIndex(4); 
-                                ImGui::Text("PID: %lu", conn.pid);
-
+                                ImGui::Text("%lu", conn.pid);
                                 ImGui::TableSetColumnIndex(5);
-                                if (ImGui::Button("Inspect")) {
+                                std::string geoInfo = GetCachedGeo(conn.remoteIp); 
+                                if (geoInfo.empty()) {
+                                    if (conn.remoteIp == "127.0.0.1" || conn.remoteIp == "0.0.0.0" || conn.remoteIp.rfind("192.168.", 0) == 0) {
+                                        ImGui::TextDisabled("Local Network");
+                                    } else {
+                                        if (ImGui::SmallButton("Lookup##geo")) {
+                                            std::thread(AsyncFetchGeoIP, conn.remoteIp).detach();
+                                        }
+                                    }
+                                } else {
+                                    ImGui::Text("%s", geoInfo.c_str());
+                                }
+                                ImGui::TableSetColumnIndex(6);
+                                if (ImGui::SmallButton("Inspect")) {
                                     selectedNetConn = conn;
                                     showNetDetailsModal = true;
                                 }
@@ -9176,12 +10270,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                         ImGui::Spacing();
 
-                        ImGui::TextColored(themes[currentThemeIndex].accentColor, "Extracted Web Browser History & Artifacts (Multi-Browser)");
+                        static int selectedBrowserFilter = 0;
+                        const char* browserFilters[] = { "All Browsers", "Google Chrome", "Microsoft Edge", "Brave Browser", "Mozilla Firefox / Nightly" };
+                        
+                        ImGui::SetNextItemWidth(220.0f);
+                        ImGui::Combo("Filter Browser", &selectedBrowserFilter, browserFilters, IM_ARRAYSIZE(browserFilters));
                         ImGui::SameLine();
-                        ImGui::Text(" | TOTAL: %zu", cachedBrowserHistory.size());
+
+                        ImGui::TextColored(themes[currentThemeIndex].accentColor, "Extracted Web Browser History & Artifacts");
                         ImGui::Spacing();
 
-                        float tableHeight = (float)winHeight - 240.0f;
+                        float tableHeight = (float)winHeight - 280.0f;
                         ImGuiTableFlags browserTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
 
                         if (ImGui::BeginTable("BrowserHistoryTable", 4, browserTableFlags, ImVec2(0, tableHeight))) {
@@ -9191,8 +10290,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             ImGui::TableSetupColumn("Timestamp", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                             ImGui::TableHeadersRow();
 
+                            size_t displayedCount = 0;
+
                             for (size_t i = 0; i < cachedBrowserHistory.size(); ++i) {
                                 const auto& hist = cachedBrowserHistory[i];
+
+                                if (selectedBrowserFilter == 1 && hist.browserName.find("Chrome") == std::string::npos) continue;
+                                if (selectedBrowserFilter == 2 && hist.browserName.find("Edge") == std::string::npos) continue;
+                                if (selectedBrowserFilter == 3 && hist.browserName.find("Brave") == std::string::npos) continue;
+                                if (selectedBrowserFilter == 4 && hist.browserName.find("Firefox") == std::string::npos) continue;
+
+                                displayedCount++;
                                 ImGui::TableNextRow();
                                 ImGui::PushID((int)(30000 + i));
                                 
@@ -9211,6 +10319,194 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                 ImGui::PopID();
                             }
                             ImGui::EndTable();
+                            
+                            ImGui::Text("Showing %zu of %zu total records (Newest first).", displayedCount, cachedBrowserHistory.size());
+                        }
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Browser Cookies")) {
+                        ImGui::Spacing();
+
+                        if (ImGui::Button("Load / Refresh Cookies")) {
+                            cachedBrowserCookies.clear();
+                            cachedBrowserCookies = LoadBrowserCookies(); 
+                        }
+
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Total Cookies Extracted: %zu", cachedBrowserCookies.size());
+                        ImGui::Spacing();
+
+                        // --- NUEVO: Filtro desplegable por navegador ---
+                        static int selectedCookieBrowserFilter = 0;
+                        const char* cookieBrowserFilters[] = { "All Browsers", "Google Chrome", "Microsoft Edge", "Brave Browser", "Mozilla Firefox" };
+                        
+                        ImGui::SetNextItemWidth(180.0f);
+                        ImGui::Combo("Filter Browser##Cookies", &selectedCookieBrowserFilter, cookieBrowserFilters, IM_ARRAYSIZE(cookieBrowserFilters));
+                        ImGui::SameLine();
+
+                        static char cookieSearchBuf[128] = "";
+                        ImGui::SetNextItemWidth(220);
+                        ImGui::InputText("##CookieSearch", cookieSearchBuf, sizeof(cookieSearchBuf));
+                        if (cookieSearchBuf[0] == '\0') {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("(Filter Host/Name)");
+                        }
+                        
+                        ImGui::Spacing();
+
+                        float tableHeight = (float)winHeight - 280.0f;
+                        ImGuiTableFlags cookieTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                        if (ImGui::BeginTable("BrowserCookiesTable", 5, cookieTableFlags, ImVec2(0, tableHeight))) {
+                            ImGui::TableSetupColumn("Browser", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                            ImGui::TableSetupColumn("Host / Domain", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+                            ImGui::TableSetupColumn("Cookie Name", ImGuiTableColumnFlags_WidthStretch, 1.5f);
+                            ImGui::TableSetupColumn("Value (Snippet)", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                            ImGui::TableSetupColumn("Creation Time", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                            ImGui::TableHeadersRow();
+
+                            std::string cookieFilter = cookieSearchBuf;
+                            std::transform(cookieFilter.begin(), cookieFilter.end(), cookieFilter.begin(), ::tolower);
+
+                            size_t displayedCookies = 0;
+
+                            for (size_t i = 0; i < cachedBrowserCookies.size(); ++i) {
+                                const auto& cookie = cachedBrowserCookies[i];
+                                
+                                // --- NUEVO: Aplicar filtro de navegador ---
+                                if (selectedCookieBrowserFilter == 1 && cookie.browserName.find("Chrome") == std::string::npos) continue;
+                                if (selectedCookieBrowserFilter == 2 && cookie.browserName.find("Edge") == std::string::npos) continue;
+                                if (selectedCookieBrowserFilter == 3 && cookie.browserName.find("Brave") == std::string::npos) continue;
+                                if (selectedCookieBrowserFilter == 4 && cookie.browserName.find("Firefox") == std::string::npos) continue;
+
+                                if (!cookieFilter.empty()) {
+                                    std::string hostLower = cookie.hostKey;
+                                    std::string nameLower = cookie.name;
+                                    std::transform(hostLower.begin(), hostLower.end(), hostLower.begin(), ::tolower);
+                                    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+                                    if (hostLower.find(cookieFilter) == std::string::npos && nameLower.find(cookieFilter) == std::string::npos) {
+                                        continue;
+                                    }
+                                }
+
+                                displayedCookies++;
+                                ImGui::TableNextRow();
+                                ImGui::PushID((int)(50000 + i));
+
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::Text("%s", cookie.browserName.c_str());
+
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s", cookie.hostKey.c_str());
+
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::Text("%s", cookie.name.c_str());
+
+                                ImGui::TableSetColumnIndex(3);
+                                ImGui::TextDisabled("%s", cookie.value.c_str());
+
+                                ImGui::TableSetColumnIndex(4);
+                                ImGui::Text("%s", cookie.creationUtc.c_str());
+
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+
+                            ImGui::Spacing();
+                            ImGui::Text("Showing %zu of %zu total cookies.", displayedCookies, cachedBrowserCookies.size());
+                        }
+                        ImGui::EndTabItem();
+                    }
+
+                    if (ImGui::BeginTabItem("Browser Downloads")) {
+                        ImGui::Spacing();
+
+                        if (ImGui::Button("Load / Refresh Downloads")) {
+                            cachedBrowserDownloads.clear();
+                            cachedBrowserDownloads = LoadBrowserDownloads();
+                        }
+
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Total Downloads Logged: %zu", cachedBrowserDownloads.size());
+                        ImGui::Spacing();
+
+                        static int selectedDownloadBrowserFilter = 0;
+                        const char* downloadBrowserFilters[] = { "All Browsers", "Google Chrome", "Microsoft Edge", "Brave Browser", "Mozilla Firefox" };
+                        
+                        ImGui::SetNextItemWidth(180.0f);
+                        ImGui::Combo("Filter Browser##Downloads", &selectedDownloadBrowserFilter, downloadBrowserFilters, IM_ARRAYSIZE(downloadBrowserFilters));
+                        ImGui::SameLine();
+
+                        static char downloadSearchBuf[128] = "";
+                        ImGui::SetNextItemWidth(220);
+                        ImGui::InputText("##DownloadSearch", downloadSearchBuf, sizeof(downloadSearchBuf));
+                        if (downloadSearchBuf[0] == '\0') {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("(Filter Path/URL)");
+                        }
+
+                        ImGui::Spacing();
+
+                        float tableHeight = (float)winHeight - 240.0f;
+                        ImGuiTableFlags downloadTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                        if (ImGui::BeginTable("BrowserDownloadsTable", 5, downloadTableFlags, ImVec2(0, tableHeight))) {
+                            ImGui::TableSetupColumn("Browser", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                            ImGui::TableSetupColumn("Target File Path", ImGuiTableColumnFlags_WidthStretch, 2.5f);
+                            ImGui::TableSetupColumn("Source URL", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                            ImGui::TableSetupColumn("Downloaded Size", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                            ImGui::TableSetupColumn("Start Time", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                            ImGui::TableHeadersRow();
+
+                            std::string downloadFilter = downloadSearchBuf;
+                            std::transform(downloadFilter.begin(), downloadFilter.end(), downloadFilter.begin(), ::tolower);
+
+                            size_t displayedDownloads = 0;
+
+                            for (size_t i = 0; i < cachedBrowserDownloads.size(); ++i) {
+                                const auto& dl = cachedBrowserDownloads[i];
+
+                                if (selectedDownloadBrowserFilter == 1 && dl.browserName.find("Chrome") == std::string::npos) continue;
+                                if (selectedDownloadBrowserFilter == 2 && dl.browserName.find("Edge") == std::string::npos) continue;
+                                if (selectedDownloadBrowserFilter == 3 && dl.browserName.find("Brave") == std::string::npos) continue;
+                                if (selectedDownloadBrowserFilter == 4 && dl.browserName.find("Firefox") == std::string::npos) continue;
+
+                                if (!downloadFilter.empty()) {
+                                    std::string pathLower = dl.targetPath;
+                                    std::string urlLower = dl.tabUrl;
+                                    std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
+                                    std::transform(urlLower.begin(), urlLower.end(), urlLower.begin(), ::tolower);
+                                    if (pathLower.find(downloadFilter) == std::string::npos && urlLower.find(downloadFilter) == std::string::npos) {
+                                        continue;
+                                    }
+                                }
+
+                                displayedDownloads++;
+                                ImGui::TableNextRow();
+                                ImGui::PushID((int)(60000 + i));
+
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::Text("%s", dl.browserName.c_str());
+
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextColored(ImVec4(0.1f, 0.9f, 0.3f, 1.0f), "%s", dl.targetPath.c_str());
+
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::TextDisabled("%s", dl.tabUrl.c_str());
+
+                                ImGui::TableSetColumnIndex(3);
+                                ImGui::Text("%s", dl.receivedBytes.c_str());
+
+                                ImGui::TableSetColumnIndex(4);
+                                ImGui::Text("%s", dl.startTime.c_str());
+
+                                ImGui::PopID();
+                            }
+                            ImGui::EndTable();
+
+                            ImGui::Spacing();
+                            ImGui::Text("Showing %zu of %zu total downloads.", displayedDownloads, cachedBrowserDownloads.size());
                         }
                         ImGui::EndTabItem();
                     }
@@ -9218,6 +10514,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     ImGui::EndTabBar();
                 }
                 ImGui::EndTabItem();
+
             }
 
             // TAB: INSTALLED APPS
@@ -11121,14 +12418,46 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
 
         if (showConnections) {
-            ImGui::SetNextWindowSize(ImVec2(750, 400), ImGuiCond_FirstUseEver);
-            if (ImGui::Begin("Process Network Connections", &showConnections)) {
+            ImGui::SetNextWindowSize(ImVec2(750, 440), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Process Network Connections", &showConnections)) {            
+                static DWORD lastCheckedPid = 0;
+                static bool isIsolated = false;
+                if (selectedPid != lastCheckedPid) {
+                    isIsolated = IsProcessIsolated(selectedPid);
+                    lastCheckedPid = selectedPid;
+                }
+
+                if (!isIsolated) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
+                    
+                    if (ImGui::Button("Isolate Process (Block Network via Firewall)", ImVec2(-1, 32))) {
+                        BlockProcessViaFirewall(selectedPid);
+                        isIsolated = true;
+                    }
+                    ImGui::PopStyleColor(3);
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.3f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.4f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.5f, 0.2f, 1.0f));
+                    
+                    if (ImGui::Button("Restore Network / Unblock Process", ImVec2(-1, 32))) {
+                        UnblockProcessViaFirewall(selectedPid);
+                        isIsolated = false;
+                    }
+                    ImGui::PopStyleColor(3);
+                }
+                
+                ImGui::Separator();
+                ImGui::Spacing();
+
                 if (!connectionsError.empty()) {
                     ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", connectionsError.c_str());
                 } else if (cachedConnections.empty()) {
                     ImGui::Text("No active TCP connections found for this process.");
                 } else {
-                    if (ImGui::BeginTable("ConnTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 320))) {
+                    if (ImGui::BeginTable("ConnTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 300))) {
                         ImGui::TableSetupColumn("Protocol", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                         ImGui::TableSetupColumn("Local Address", ImGuiTableColumnFlags_WidthFixed, 180.0f);
                         ImGui::TableSetupColumn("Remote Address", ImGuiTableColumnFlags_WidthFixed, 180.0f);
