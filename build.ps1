@@ -32,8 +32,8 @@ $output = "ForensicTaskManager.exe"
 $includes = @(
     "-Iimgui", 
     "-I.", 
-    "-IC:\Users\Nooch\Desktop\Projects\taaskmanager\yara-4.6.0\yara-4.6.0\libyara",
-    "-IC:\Users\Nooch\Desktop\Projects\taaskmanager\yara-4.6.0\yara-4.6.0\libyara\include"
+    "-IC:\your\route\to\yara-4.6.0\yara-4.6.0\libyara",
+    "-IC:\your\route\to\yara-4.6.0\yara-4.6.0\libyara\include"
 )
 
 $libs = @(
@@ -41,7 +41,7 @@ $libs = @(
     "-loleaut32", "-luuid", "-liphlpapi", "-lcomdlg32", "-ldbghelp", 
     "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3", 
     "-lbcrypt", "-lsetupapi", "-lpdh", "-lwinhttp", "-lsecur32",
-    "-LC:\Users\Nooch\Desktop\Projects\taaskmanager\yara-4.6.0\yara-4.6.0\libyara\.libs",
+    "-LC:\your\route\to\yara-4.6.0\yara-4.6.0\libyara\.libs",
     "-lyara",
     "-lssl", "-lcrypto", "-lws2_32", "-lcrypt32"
 )
