@@ -142,9 +142,31 @@ As an intermediate-to-advanced C++ learning project, several components are acti
 ### Prerequisites
 - Windows 10 or 11
 - **MinGW-w64** (or a compatible `g++` compiler installed and added to your system PATH).
+- **MSYS2 (UCRT64 environment)** to compile YARA (`libyara`) and OpenSSL dependencies from source.
+
+### YARA Dependencies & Manual Source Compilation (v1.0.6+)
+If you prefer to compile `libyara` manually from source, open your **MSYS2 UCRT64** terminal and follow these steps:
+
+1. Install the required build toolchain and dependencies:
+  ```bash
+  pacman -S --needed base-devel mingw-w64-ucrt-x86_64-toolchain \
+                    mingw-w64-ucrt-x86_64-yara \
+                    mingw-w64-ucrt-x86_64-openssl
+  ```
+2. Navigate to you YARA source directory and configure/compile the library:
+  ```bash
+  ./bootstrap.sh
+  ./configure
+  make
+  ```
+3. Generate the static library archive (`libyara.a`) from the compiled object files:
+  ```bash
+  find . -name "*.o" -exec ar rcs .libs/libyara.a {} +
+  ```
+
 
 ### Quick Build & Portable Packaging (PowerShell Script)
-To avoid manual configuration or heavy IDE setups, you can use the automated PowerShell script (`build.ps1`). It compiles the source code, links resource files (`app.res` / custom application manifests), and statically links all required Win32, OpenGL, and runtime libraries (`-static`, `-static-libgcc`, `-static-libstdc++`) to generate a **fully self-contained, standalone executable** (`ForensicTaskManager.exe`) capable of running on any clean Windows machine without missing DLL errors (such as `libwinpthread-1.dll`).
+To avoid manual configuration or heavy IDE setups, you can use the automated PowerShell script (`build.ps1`). It compiles the source code, links resource files (app.res / custom application manifests), and statically links all required Win32, OpenGL, YARA, OpenSSL, and runtime libraries (`-static`, `-static-libgcc`, `-static-libstdc++`) to generate a fully self-contained, standalone executable (`ForensicTaskManager.exe`) capable of running on any clean Windows machine without missing DLL errors.
 
 1. Clone the repository:
    ```bash
@@ -160,8 +182,11 @@ To avoid manual configuration or heavy IDE setups, you can use the automated Pow
     ```bash
     Set-ExecutionPolicy Unrestricted -Scope Process
     ```
+4. Edit Paths on build.ps1
 
-4. Run the build script:
+<img width="542" height="326" alt="imagen" src="https://github.com/user-attachments/assets/0fc069e8-de70-437c-aeff-ae88420359fc" />
+
+6. Run the build script:
     ```bash
     .\build.ps1
     ```
