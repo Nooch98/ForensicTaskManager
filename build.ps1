@@ -28,9 +28,23 @@ $sources = @(
 )
 
 $output = "ForensicTaskManager.exe"
-$includes = "-Iimgui", "-I."
 
-$libs = "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", "-loleaut32", "-luuid", "-liphlpapi", "-lws2_32", "-lcomdlg32", "-ldbghelp", "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3", "-lbcrypt", "-lsetupapi", "-lpdh", "-lwinhttp", "-lsecur32"
+$includes = @(
+    "-Iimgui", 
+    "-I.", 
+    "-IC:\Users\Nooch\Desktop\Projects\taaskmanager\yara-4.6.0\yara-4.6.0\libyara",
+    "-IC:\Users\Nooch\Desktop\Projects\taaskmanager\yara-4.6.0\yara-4.6.0\libyara\include"
+)
+
+$libs = @(
+    "-lopengl32", "-lgdi32", "-luser32", "-lshell32", "-lpsapi", "-lole32", 
+    "-loleaut32", "-luuid", "-liphlpapi", "-lcomdlg32", "-ldbghelp", 
+    "-ldwmapi", "-luserenv", "-lwintrust", "-lwevtapi", "-lmsi", "-lsqlite3", 
+    "-lbcrypt", "-lsetupapi", "-lpdh", "-lwinhttp", "-lsecur32",
+    "-LC:\Users\Nooch\Desktop\Projects\taaskmanager\yara-4.6.0\yara-4.6.0\libyara\.libs",
+    "-lyara",
+    "-lssl", "-lcrypto", "-lws2_32", "-lcrypt32"
+)
 
 $staticFlags = "-static", "-static-libgcc", "-static-libstdc++"
 
