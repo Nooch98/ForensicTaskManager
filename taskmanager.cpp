@@ -50,6 +50,7 @@
 #include <winhttp.h>
 #include <ntsecapi.h>
 #include <winternl.h>
+#include <yara.h>
 #include "desktop_widget.h"
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -6000,6 +6001,106 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
             }
         }
 
+        if (ImGui::MenuItem("Scan Process with Custom YARA Rule...")) {
+            if (!p.exePath.empty()) {
+                DWORD targetPid = p.pid;
+                std::string targetPath = p.exePath;
+                std::string procName = p.name;
+
+                char szFile[MAX_PATH] = { 0 };
+                OPENFILENAMEA ofn = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "YARA Rules (*.yar)\0*.yar\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = szFile;
+                ofn.nMaxFile = sizeof(szFile);
+                ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+                if (GetOpenFileNameA(&ofn) == TRUE) {
+                    std::string ruleFilePath = ofn.lpstrFile;
+
+                    std::thread([targetPid, targetPath, procName, ruleFilePath, hwnd]() {
+                        struct ScanContext {
+                            std::vector<std::string> matchedRules;
+                        };
+                        ScanContext context;
+
+                        auto yaraCallback = [](YR_SCAN_CONTEXT* context_ptr, int message, void* message_data, void* user_data) -> int {
+                            if (message == CALLBACK_MSG_RULE_MATCHING) {
+                                YR_RULE* rule = (YR_RULE*)message_data;
+                                ScanContext* ctx = (ScanContext*)user_data;
+                                if (rule && ctx) {
+                                    ctx->matchedRules.push_back(rule->identifier);
+                                }
+                            }
+                            return CALLBACK_CONTINUE;
+                        };
+
+                        YR_COMPILER* compiler = NULL;
+                        if (yr_compiler_create(&compiler) == ERROR_SUCCESS) {
+                            FILE* ruleFile = fopen(ruleFilePath.c_str(), "r");
+                            if (ruleFile) {
+                                int compileResult = yr_compiler_add_file(compiler, ruleFile, NULL, ruleFilePath.c_str());
+                                fclose(ruleFile);
+
+                                if (compileResult == 0) {
+                                    YR_RULES* rules = NULL;
+                                    yr_compiler_get_rules(compiler, &rules);
+
+                                    if (rules) {
+                                        int fileScanResult = yr_rules_scan_file(
+                                            rules, 
+                                            targetPath.c_str(), 
+                                            SCAN_FLAGS_FAST_MODE, 
+                                            yaraCallback, 
+                                            &context, 
+                                            0
+                                        );
+
+                                        int procScanResult = ERROR_SUCCESS;
+                                        if (targetPid != 0) {
+                                            procScanResult = yr_rules_scan_proc(
+                                                rules, 
+                                                targetPid, 
+                                                SCAN_FLAGS_FAST_MODE, 
+                                                yaraCallback, 
+                                                &context, 
+                                                0
+                                            );
+                                        }
+
+                                        if (!context.matchedRules.empty()) {
+                                            std::sort(context.matchedRules.begin(), context.matchedRules.end());
+                                            context.matchedRules.erase(std::unique(context.matchedRules.begin(), context.matchedRules.end()), context.matchedRules.end());
+                                        }
+
+                                        std::string message = "YARA Dual-Scan Report (" + procName + "):\n\n";
+                                        if (!context.matchedRules.empty()) {
+                                            message += "[!] THREAT DETECTED - Matching Rules:\n";
+                                            for (const auto& r : context.matchedRules) {
+                                                message += " - " + r + "\n";
+                                            }
+                                            MessageBoxA(hwnd, message.c_str(), "YARA Engine Alert (Disk & Memory)", MB_OK | MB_ICONWARNING);
+                                        } else {
+                                            message += "Status: Clean (No rules matched in file or process memory).";
+                                            MessageBoxA(hwnd, message.c_str(), "YARA Engine Scan", MB_OK | MB_ICONINFORMATION);
+                                        }
+
+                                        yr_rules_destroy(rules);
+                                    }
+                                } else {
+                                    MessageBoxA(hwnd, "Failed to compile the selected YARA rule file. Check syntax.", "YARA Compiler Error", MB_OK | MB_ICONERROR);
+                                }
+                            } else {
+                                MessageBoxA(hwnd, "Could not open the specified YARA rule file.", "File Error", MB_OK | MB_ICONERROR);
+                            }
+                            yr_compiler_destroy(compiler);
+                        }
+                    }).detach();
+                }
+            }
+        }
+
         ImGui::Separator();
 
         if (ImGui::MenuItem("Reveal Executable in Explorer")) {
@@ -6192,11 +6293,11 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     if (isOpen) {
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                                 modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                 connectionsPid, showConnections, cachedConnections, connectionsError,
-                                 handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
-                                 cachedProcesses,
-                                 monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
+                               modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                               connectionsPid, showConnections, cachedConnections, connectionsError,
+                               handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                               cachedProcesses,
+                               monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
@@ -7170,6 +7271,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         return 0;
     }
 
+    yr_initialize();
+
     const wchar_t* className = L"NexusGlassManagerClass";
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);
@@ -7482,7 +7585,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             sprintf_s(cpuBuffer, "CPU: %.1f%%", cachedCpu);
             std::string cpuUsageStr = cpuBuffer;
 
-            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.5 Release";
+            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.6 Release";
             float textWidth = ImGui::CalcTextSize(statusText.c_str()).x;
             float availableWidth = ImGui::GetContentRegionAvail().x;
             if (availableWidth > textWidth) {
@@ -10337,7 +10440,6 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                         ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Total Cookies Extracted: %zu", cachedBrowserCookies.size());
                         ImGui::Spacing();
 
-                        // --- NUEVO: Filtro desplegable por navegador ---
                         static int selectedCookieBrowserFilter = 0;
                         const char* cookieBrowserFilters[] = { "All Browsers", "Google Chrome", "Microsoft Edge", "Brave Browser", "Mozilla Firefox" };
                         
@@ -10372,9 +10474,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             size_t displayedCookies = 0;
 
                             for (size_t i = 0; i < cachedBrowserCookies.size(); ++i) {
-                                const auto& cookie = cachedBrowserCookies[i];
-                                
-                                // --- NUEVO: Aplicar filtro de navegador ---
+                                const auto& cookie = cachedBrowserCookies[i];                                
                                 if (selectedCookieBrowserFilter == 1 && cookie.browserName.find("Chrome") == std::string::npos) continue;
                                 if (selectedCookieBrowserFilter == 2 && cookie.browserName.find("Edge") == std::string::npos) continue;
                                 if (selectedCookieBrowserFilter == 3 && cookie.browserName.find("Brave") == std::string::npos) continue;
@@ -11018,11 +11118,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Dump Analyzer", NULL, (currentTab == 22 ? itemFlags : 0))) {             
+            if (ImGui::BeginTabItem("Dump Analyzer", NULL, (currentTab == 22 ? itemFlags : 0))) {            
                 ImGui::Text("Select a .dmp file to inspect its structure:");
                 ImGui::Spacing();
 
-                ImGui::SetNextItemWidth(winWidth - 370);
+                static std::string lastScannedDumpPath = "";
+                static std::vector<std::string> lastMatchedRules;
+                static std::vector<std::string> lastMatchedStrings;
+                static bool hasYaraScanned = false;
+                static bool yaraScanInProgress = false;
+
+                ImGui::SetNextItemWidth(winWidth - 560);
                 ImGui::InputText("##dumpPath", analyzePathBuffer, sizeof(analyzePathBuffer));
                 ImGui::SameLine();
                 
@@ -11037,6 +11143,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     if (GetOpenFileNameA(&ofn) == TRUE) {
                         currentDumpAnalysis = AnalyzeMiniDumpFile(analyzePathBuffer);
                         dumpAnalyzed = true;
+                        hasYaraScanned = false;
+                        lastMatchedRules.clear();
+                        lastMatchedStrings.clear();
                     }
                 }
 
@@ -11046,6 +11155,182 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                         currentDumpAnalysis = AnalyzeMiniDumpFile(analyzePathBuffer);
                         dumpAnalyzed = true;
                     }
+                }
+
+                ImGui::SameLine();
+                if (ImGui::Button("Scan with YARA...", ImVec2(130, 0))) {
+                    if (strlen(analyzePathBuffer) > 0 && !yaraScanInProgress) {
+                        std::string dumpPathToScan = analyzePathBuffer;
+                        lastScannedDumpPath = dumpPathToScan;
+                        yaraScanInProgress = true;
+
+                        char szFile[MAX_PATH] = { 0 };
+                        OPENFILENAMEA ofnYara = {};
+                        ofnYara.lStructSize = sizeof(ofnYara);
+                        ofnYara.hwndOwner = hwnd;
+                        ofnYara.lpstrFilter = "YARA Rules (*.yar)\0*.yar\0All Files (*.*)\0*.*\0";
+                        ofnYara.lpstrFile = szFile;
+                        ofnYara.nMaxFile = sizeof(szFile);
+                        ofnYara.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+                        if (GetOpenFileNameA(&ofnYara) == TRUE) {
+                            std::string ruleFilePath = ofnYara.lpstrFile;
+                            std::thread([dumpPathToScan, ruleFilePath, hwnd]() {
+                                struct ScanContext {
+                                    std::vector<std::string> matchedRules;
+                                    std::vector<std::string> matchedStrings;
+                                };
+                                ScanContext context;
+
+                                auto yaraCallback = [](YR_SCAN_CONTEXT* context_ptr, int message, void* message_data, void* user_data) -> int {
+                                    ScanContext* ctx = (ScanContext*)user_data;
+                                    if (message == CALLBACK_MSG_RULE_MATCHING) {
+                                        YR_RULE* rule = (YR_RULE*)message_data;
+                                        if (rule && ctx) {
+                                            ctx->matchedRules.push_back(rule->identifier);
+
+                                            YR_STRING* string;
+                                            yr_rule_strings_foreach(rule, string) {
+                                                YR_MATCH* match;
+                                                bool hasMatched = false;
+                                                
+                                                yr_string_matches_foreach(context_ptr, string, match) {
+                                                    hasMatched = true;
+                                                    break;
+                                                }
+
+                                                if (hasMatched) {
+                                                    std::string stringId = string->identifier;
+                                                    if (std::find(ctx->matchedStrings.begin(), ctx->matchedStrings.end(), stringId) == ctx->matchedStrings.end()) {
+                                                        ctx->matchedStrings.push_back(stringId);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return CALLBACK_CONTINUE;
+                                };
+
+                                YR_COMPILER* compiler = NULL;
+                                if (yr_compiler_create(&compiler) == ERROR_SUCCESS) {
+                                    FILE* ruleFile = fopen(ruleFilePath.c_str(), "r");
+                                    if (ruleFile) {
+                                        int compileResult = yr_compiler_add_file(compiler, ruleFile, NULL, ruleFilePath.c_str());
+                                        fclose(ruleFile);
+
+                                        if (compileResult == 0) {
+                                            YR_RULES* rules = NULL;
+                                            yr_compiler_get_rules(compiler, &rules);
+
+                                            if (rules) {
+                                                yr_rules_scan_file(
+                                                    rules, 
+                                                    dumpPathToScan.c_str(), 
+                                                    SCAN_FLAGS_FAST_MODE, 
+                                                    yaraCallback, 
+                                                    &context, 
+                                                    0
+                                                );
+
+                                                lastMatchedRules = context.matchedRules;
+                                                lastMatchedStrings = context.matchedStrings;
+                                                hasYaraScanned = true;
+
+                                                yr_rules_destroy(rules);
+                                            }
+                                        } else {
+                                            MessageBoxA(hwnd, "Failed to compile the selected YARA rule file.", "YARA Compiler Error", MB_OK | MB_ICONERROR);
+                                        }
+                                    } else {
+                                        MessageBoxA(hwnd, "Could not open the specified YARA rule file.", "File Error", MB_OK | MB_ICONERROR);
+                                    }
+                                    yr_compiler_destroy(compiler);
+                                }
+                                yaraScanInProgress = false;
+                            }).detach();
+                        } else {
+                            yaraScanInProgress = false;
+                        }
+                    } else if (strlen(analyzePathBuffer) == 0) {
+                        MessageBoxA(hwnd, "Please select or specify a valid .dmp file path first.", "Notice", MB_OK | MB_ICONWARNING);
+                    }
+                }
+
+                if (hasYaraScanned) {
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.10f, 0.13f, 1.00f));
+                    if (ImGui::BeginChild("YaraResultsPanel", ImVec2(0, 140), true, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "YARA Scan Results for: %s", lastScannedDumpPath.c_str());
+                        ImGui::Separator();
+
+                        if (!lastMatchedRules.empty()) {
+                            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "[!] STATUS: THREAT OR ARTIFACT DETECTED");
+                            ImGui::Text("Triggered Rules:");
+                            for (const auto& r : lastMatchedRules) {
+                                ImGui::BulletText("%s", r.c_str());
+                            }
+
+                            ImGui::Spacing();
+                            ImGui::Text("Matched Patterns (Strings):");
+                            std::string stringsCombined = "";
+                            for (size_t i = 0; i < lastMatchedStrings.size(); ++i) {
+                                stringsCombined += lastMatchedStrings[i];
+                                if (i < lastMatchedStrings.size() - 1) stringsCombined += ", ";
+                            }
+                            ImGui::TextWrapped("%s", stringsCombined.c_str());
+                        } else {
+                            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "[+] STATUS: CLEAN (No matching rules or anomalies found).");
+                        }
+                    }
+                    ImGui::EndChild();
+                    ImGui::PopStyleColor();
+
+                    ImGui::Spacing();
+                    
+                    if (ImGui::Button("Export YARA Report...", ImVec2(160, 0))) {
+                        char szSaveFile[MAX_PATH] = "yara_detailed_dump_report.txt";
+                        OPENFILENAMEA ofnSave = {};
+                        ofnSave.lStructSize = sizeof(ofnSave);
+                        ofnSave.hwndOwner = hwnd;
+                        ofnSave.lpstrFilter = "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+                        ofnSave.lpstrFile = szSaveFile;
+                        ofnSave.nMaxFile = MAX_PATH;
+                        ofnSave.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+
+                        if (GetSaveFileNameA(&ofnSave) == TRUE) {
+                            FILE* f = fopen(szSaveFile, "w");
+                            if (f) {
+                                fprintf(f, "==================================================\n");
+                                fprintf(f, " FORENSIC TASK MANAGER - ADVANCED YARA DUMP REPORT\n");
+                                fprintf(f, "==================================================\n");
+                                fprintf(f, "Target Dump File: %s\n\n", lastScannedDumpPath.c_str());
+                                
+                                if (!lastMatchedRules.empty()) {
+                                    fprintf(f, "[!] STATUS: THREAT OR FORENSIC ARTIFACT DETECTED\n");
+                                    fprintf(f, "Triggered Rules:\n");
+                                    for (const auto& r : lastMatchedRules) {
+                                        fprintf(f, "  -> %s\n", r.c_str());
+                                    }
+                                    
+                                    fprintf(f, "\nDetailed Pattern Breakdown (Strings Matched):\n");
+                                    for (const auto& s : lastMatchedStrings) {
+                                        fprintf(f, "  [x] %s\n", s.c_str());
+                                    }
+                                } else {
+                                    fprintf(f, "[+] STATUS: CLEAN (No matching rules or anomalies found)\n");
+                                }
+                                
+                                fprintf(f, "\n==================================================\n");
+                                fclose(f);
+                                MessageBoxA(hwnd, "Detailed YARA scan report exported successfully.", "Export Complete", MB_OK | MB_ICONINFORMATION);
+                            } else {
+                                MessageBoxA(hwnd, "Could not create the export file on disk.", "Export Error", MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                } else if (yaraScanInProgress) {
+                    ImGui::Spacing();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "[*] Running YARA scan on dump file asynchronously...");
                 }
 
                 ImGui::Spacing();
@@ -12487,6 +12772,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SwapBuffers(hDC);
     }
+
+    yr_finalize();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplWin32_Shutdown();
