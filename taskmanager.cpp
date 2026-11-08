@@ -51,6 +51,7 @@
 #include <ntsecapi.h>
 #include <winternl.h>
 #include <yara.h>
+#include <map>
 #include "desktop_widget.h"
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -186,6 +187,7 @@ struct ConnectionInfoItem {
     std::string remoteAddr;
     int remotePort;
     std::string state;
+    DWORD pid;
 };
 
 struct ServiceInfoItem {
@@ -518,6 +520,14 @@ struct LogonSessionsData {
     int remoteRdpCount = 0;
     int networkCount = 0;
     int serviceCount = 0;
+};
+
+struct SecurityFinding {
+    std::string title;
+    std::string description;
+    int severityLevel;
+    DWORD targetPid;
+    std::string mitreTag;
 };
 
 std::vector<InstallerItem> g_InstallerItems;
@@ -2392,6 +2402,322 @@ CPUInfo GetDetailedCPUInfo() {
     }
 
     return info;
+}
+
+std::vector<SecurityFinding> RunSmartTriage(
+    const std::vector<ProcessInfo>& processes, 
+    const std::vector<ConnectionInfoItem>& allConnections) 
+{
+    std::vector<SecurityFinding> findings;
+
+    std::function<void(const ProcessInfo&, const std::string&)> auditNode = [&](const ProcessInfo& p, const std::string& parentName) {
+        std::string pathLower = p.exePath;
+        std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
+
+        std::string nameLower = p.name;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+
+        std::string cmdLower = p.commandLine;
+        std::transform(cmdLower.begin(), cmdLower.end(), cmdLower.begin(), ::tolower);
+
+        bool isNoPath = (pathLower == "n/a" || pathLower.empty());
+
+        if (p.isParentSpoofed) {
+            findings.push_back({
+                "Parent Spoofing / Hierarchy Anomaly",
+                "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") exhibits an anomalous parent-child relationship. Real PID/PPID mismatch or restricted parent token inheritance detected.",
+                4,
+                p.pid,
+                "T1036"
+            });
+        }
+
+        if (!parentName.empty()) {
+            std::string pParentLower = parentName;
+            std::transform(pParentLower.begin(), pParentLower.end(), pParentLower.begin(), ::tolower);
+
+            if (nameLower == "lsass.exe" && pParentLower != "wininit.exe") {
+                findings.push_back({
+                    "Unauthorized Parent for Critical Process",
+                    "Critical security process 'lsass.exe' (PID: " + std::to_string(p.pid) + ") was spawned by unauthorized parent '" + parentName + "'. Expected parent: wininit.exe. Potential process hollowing or injection.",
+                    4,
+                    p.pid,
+                    "T1036"
+                });
+            } else if (nameLower == "svchost.exe" && pParentLower != "services.exe" && pParentLower != "smss.exe") {
+                findings.push_back({
+                    "Unauthorized Parent for Service Host",
+                    "Service host process 'svchost.exe' (PID: " + std::to_string(p.pid) + ") was spawned by unexpected parent '" + parentName + "'. Expected parent: services.exe.",
+                    4,
+                    p.pid,
+                    "T1036"
+                });
+            } else if (nameLower == "wininit.exe" && pParentLower != "smss.exe") {
+                findings.push_back({
+                    "Unauthorized Parent for Windows Initialization",
+                    "Core system process 'wininit.exe' (PID: " + std::to_string(p.pid) + ") was spawned by unexpected parent '" + parentName + "'. Expected parent: smss.exe.",
+                    4,
+                    p.pid,
+                    "T1036"
+                });
+            } else if (nameLower == "csrss.exe" && pParentLower != "smss.exe" && pParentLower != "csrss.exe" && pParentLower != "ntoskrnl.exe" && pParentLower != "[system process]" && pParentLower != "system") {
+                findings.push_back({
+                    "Unauthorized Parent for Client Server Runtime",
+                    "Critical subsystem 'csrss.exe' (PID: " + std::to_string(p.pid) + ") launched from anomalous parent '" + parentName + "'. Expected parent: smss.exe.",
+                    4,
+                    p.pid,
+                    "T1036"
+                });
+            } else if (nameLower == "explorer.exe" && pParentLower != "userinit.exe" && pParentLower != "winlogon.exe" && pParentLower != "svchost.exe" && pParentLower != "explorer.exe") {
+                findings.push_back({
+                    "Anomalous Shell Parent",
+                    "Windows Shell 'explorer.exe' (PID: " + std::to_string(p.pid) + ") was spawned by an unusual parent '" + parentName + "'. Potential persistence or wrapper execution.",
+                    3,
+                    p.pid,
+                    "T1036"
+                });
+            } else if ((nameLower == "services.exe" || nameLower == "winlogon.exe") && pParentLower != "smss.exe" && pParentLower != "ntoskrnl.exe" && pParentLower != "[system process]" && pParentLower != "system") {
+                findings.push_back({
+                    "Anomalous System Process Parent",
+                    "Core system process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") launched from unusual parent '" + parentName + "'.",
+                    4,
+                    p.pid,
+                    "T1036"
+                });
+            }
+        }
+
+        if (!isNoPath && (nameLower == "svchost.exe" || nameLower == "lsass.exe" || nameLower == "csrss.exe" || nameLower == "smss.exe") &&
+            pathLower.find("windows\\system32") == std::string::npos) {
+            findings.push_back({
+                "System Binary Masquerading",
+                "Critical system binary name '" + p.name + "' is executing from an unauthorized path: '" + p.exePath + "'. Expected execution context: C:\\Windows\\System32\\.",
+                4,
+                p.pid,
+                "T1036.003"
+            });
+        }
+
+        if (!cmdLower.empty()) {
+            if (cmdLower.find("-enc") != std::string::npos || 
+                cmdLower.find("-encodedcommand") != std::string::npos ||
+                cmdLower.find("iex") != std::string::npos ||
+                cmdLower.find("downloadstring") != std::string::npos ||
+                cmdLower.find("vssadmin delete shadows") != std::string::npos ||
+                cmdLower.find("wbadmin delete catalog") != std::string::npos ||
+                cmdLower.find("bcdedit /set") != std::string::npos) {
+                findings.push_back({
+                    "Suspicious Command Line / Obfuscation",
+                    "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") invoked with high-risk arguments / encoded payloads. Full Command Line: " + p.commandLine,
+                    4,
+                    p.pid,
+                    "T1059.001"
+                });
+            }
+        }
+
+        if (!isNoPath && (nameLower == "cmd.exe" || nameLower == "powershell.exe" || nameLower == "wscript.exe" || nameLower == "cscript.exe")) {
+            if (pathLower.find("appdata\\local\\temp") != std::string::npos || 
+                pathLower.find("\\temp\\") != std::string::npos || 
+                pathLower.find("\\downloads\\") != std::string::npos) {
+                findings.push_back({
+                    "Script Interpreter in Volatile Path",
+                    "Command shell or script interpreter '" + p.name + "' (PID: " + std::to_string(p.pid) + ") is running directly from a suspicious drop directory: '" + p.exePath + "'.",
+                    4,
+                    p.pid,
+                    "T1059"
+                });
+            }
+        }
+
+        if (!cmdLower.empty()) {
+            if (cmdLower.find("schtasks /create") != std::string::npos || 
+                cmdLower.find("sc create") != std::string::npos ||
+                (cmdLower.find("reg add") != std::string::npos && cmdLower.find("\\run") != std::string::npos)) {
+                findings.push_back({
+                    "Persistence Mechanism via Command Line",
+                    "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") is attempting persistence registration (Scheduled Task / Service / Registry Run Key). Command: " + p.commandLine,
+                    3,
+                    p.pid,
+                    "T1053"
+                });
+            }
+        }
+
+        if (nameLower.find("msedge") != std::string::npos || 
+            nameLower.find("chrome") != std::string::npos || 
+            nameLower.find("firefox") != std::string::npos) {
+            
+            for (const auto& child : p.children) {
+                std::string childNameLower = child.name;
+                std::transform(childNameLower.begin(), childNameLower.end(), childNameLower.begin(), ::tolower);
+
+                if (childNameLower == "cmd.exe" || 
+                    childNameLower == "powershell.exe" || 
+                    childNameLower == "cscript.exe" || 
+                    childNameLower == "wscript.exe" ||
+                    childNameLower == "mshta.exe") {
+                    
+                    findings.push_back({
+                        "Browser Executing Shell / Command Line",
+                        "Browser process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") unsafely spawned child shell '" + child.name + "' (PID: " + std::to_string(child.pid) + "). Potential Drive-by Compromise vector.",
+                        4,
+                        p.pid,
+                        "T1189"
+                    });
+                }
+            }
+        }
+
+        bool isInSafeLocation = (!isNoPath && (pathLower.find("windows\\system32") != std::string::npos || 
+                                 pathLower.find("windows\\syswow64") != std::string::npos ||
+                                 pathLower.find("program files") != std::string::npos));
+
+        bool isTrustedDevTool = (nameLower.find("code.exe") != std::string::npos || 
+                                 nameLower.find("devenv.exe") != std::string::npos || 
+                                 nameLower.find("node.exe") != std::string::npos ||
+                                 nameLower.find("forensictaskmanager") != std::string::npos);
+
+        if (p.pid > 4 && !isNoPath) {
+            std::string memError;
+            std::vector<MemoryRegion> regions = GetProcessMemoryMap(p.pid, memError);
+            if (memError.empty() && !regions.empty()) {
+                bool hasRwx = false;
+                bool hasExplicitSuspiciousMem = false;
+                size_t rwxCount = 0;
+
+                for (const auto& reg : regions) {
+                    bool isExecutable = (reg.protect & PAGE_EXECUTE) || 
+                                        (reg.protect & PAGE_EXECUTE_READ) || 
+                                        (reg.protect & PAGE_EXECUTE_READWRITE) || 
+                                        (reg.protect & PAGE_EXECUTE_WRITECOPY);
+                    
+                    bool isWritable = (reg.protect & PAGE_READWRITE) || 
+                                      (reg.protect & PAGE_EXECUTE_READWRITE) || 
+                                      (reg.protect & PAGE_WRITECOPY);
+
+                    if (isExecutable && isWritable) {
+                        hasRwx = true;
+                        rwxCount++;
+                    }
+
+                    if (reg.isSuspicious) {
+                        hasExplicitSuspiciousMem = true;
+                    }
+                }
+
+                if (hasRwx && (!isInSafeLocation || hasExplicitSuspiciousMem) && !isTrustedDevTool) {
+                    findings.push_back({
+                        "RWX Memory Region Detected",
+                        "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") contains " + std::to_string(rwxCount) + 
+                        " executable memory pages with write/execute permissions (RWX) residing outside standard safe paths (" + p.exePath + ").",
+                        4,
+                        p.pid,
+                        "T1055"
+                    });
+                } else if (hasRwx && isTrustedDevTool && hasExplicitSuspiciousMem) {
+                    findings.push_back({
+                        "JIT/RWX Region in Dev Tool",
+                        "Trusted development process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") has RWX memory regions with suspicious markers.",
+                        2,
+                        p.pid,
+                        "T1055"
+                    });
+                }
+            }
+        }
+
+        if (!isNoPath) {
+            if (pathLower.find("appdata\\local\\temp") != std::string::npos || 
+                pathLower.find("\\temp\\") != std::string::npos || 
+                pathLower.find("\\downloads\\") != std::string::npos ||
+                pathLower.find("\\public\\") != std::string::npos ||
+                pathLower.find("\\perflogs\\") != std::string::npos) {
+                findings.push_back({
+                    "Process Running from Volatile/User Directory",
+                    "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") is executing directly from a high-risk volatile path: '" + p.exePath + "'. Common staging area for dropped malware.",
+                    3,
+                    p.pid,
+                    "T1204"
+                });
+            }
+        }
+
+        if (!isNoPath) {
+            bool isInProtectedPath = (pathLower.find("windows\\system32") != std::string::npos || 
+                                      pathLower.find("windows\\syswow64") != std::string::npos ||
+                                      pathLower.find("windows\\systemapps") != std::string::npos ||
+                                      pathLower.find("program files") != std::string::npos);
+
+            bool isOurApp = (nameLower.find("forensictaskmanager") != std::string::npos);
+
+            if (!p.isSigned && !isInProtectedPath && !isOurApp) {
+                findings.push_back({
+                    "Unsigned Binary in Non-Standard Path",
+                    "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") lacks a valid Authenticode digital signature. Binary location: '" + p.exePath + "'.",
+                    2,
+                    p.pid,
+                    "T1036"
+                });
+            }
+        }
+
+        for (const auto& conn : allConnections) {
+            if (conn.pid == p.pid) {
+                if (conn.state == "ESTABLISHED" && 
+                    conn.remoteAddr.find("127.0.0.1") == std::string::npos && 
+                    conn.remoteAddr.find("::1") == std::string::npos &&
+                    conn.remoteAddr.find("0.0.0.0") == std::string::npos) {
+                    
+                    std::string remoteIp = conn.remoteAddr;
+                    size_t colonPos = remoteIp.find(':');
+                    if (colonPos != std::string::npos) {
+                        remoteIp = remoteIp.substr(0, colonPos);
+                    }
+
+                    bool isPrivateIp = (remoteIp.find("10.") == 0 || 
+                                        remoteIp.find("192.168.") == 0 || 
+                                        remoteIp.find("172.16.") == 0 || 
+                                        remoteIp == "0.0.0.0");
+
+                    bool isBrowserOrUpdate = (nameLower.find("chrome") != std::string::npos ||
+                                              nameLower.find("msedge") != std::string::npos ||
+                                              nameLower.find("firefox") != std::string::npos ||
+                                              nameLower.find("code") != std::string::npos ||
+                                              nameLower.find("onedrive") != std::string::npos ||
+                                              nameLower.find("discord") != std::string::npos);
+
+                    if (!isPrivateIp && !isBrowserOrUpdate) {
+                        findings.push_back({
+                            "Active External Network Connection",
+                            "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") maintains an active socket connection with external public endpoint: [" + conn.remoteAddr + "].",
+                            3,
+                            p.pid,
+                            "T1071"
+                        });
+                    } else if (!isPrivateIp && isBrowserOrUpdate) {
+                        findings.push_back({
+                            "Active External Network Connection",
+                            "Process '" + p.name + "' (PID: " + std::to_string(p.pid) + ") maintains an active socket connection with remote endpoint: [" + conn.remoteAddr + "].",
+                            2,
+                            p.pid,
+                            "T1071"
+                        });
+                    }
+                }
+            }
+        }
+
+        for (const auto& child : p.children) {
+            auditNode(child, p.name);
+        }
+    };
+
+    for (const auto& p : processes) {
+        auditNode(p, "");
+    }
+
+    return findings;
 }
 
 std::string GetTotalRAMString() {
@@ -5799,6 +6125,27 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     std::string pNameLower = p.name;
     std::transform(pNameLower.begin(), pNameLower.end(), pNameLower.begin(), ::tolower);
 
+    int riskScore = 0;
+    std::vector<std::string> riskFactors;
+
+    if (p.isParentSpoofed) {
+        riskScore += 45;
+        riskFactors.push_back("Parent Spoofing Anomaly Detected");
+    }
+    if (!p.isSigned && p.exePath != "N/A" && !p.exePath.empty()) {
+        riskScore += 20;
+        riskFactors.push_back("Unsigned Binary");
+    }
+    std::string pathLower = p.exePath;
+    std::transform(pathLower.begin(), pathLower.end(), pathLower.begin(), ::tolower);
+    if (pathLower.find("appdata\\local\\temp") != std::string::npos || 
+        pathLower.find("\\temp\\") != std::string::npos || 
+        pathLower.find("\\downloads\\") != std::string::npos) {
+        riskScore += 30;
+        riskFactors.push_back("Running from Suspicious Directory (Temp/Downloads)");
+    }
+    if (riskScore > 100) riskScore = 100;
+
     bool matchesFilter = filterStr.empty() || (pNameLower.find(filterStr) != std::string::npos);
     bool childMatches = false;
     if (!filterStr.empty()) {
@@ -5834,13 +6181,13 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
 
     char label[256];
     snprintf(label, sizeof(label), "%s##%lu", p.name.c_str(), p.pid);
-    if (p.isParentSpoofed) {
+    if (p.isParentSpoofed || riskScore >= 50) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
     }
 
     bool isOpen = ImGui::TreeNodeEx(label, flags);
 
-    if (p.isParentSpoofed) {
+    if (p.isParentSpoofed || riskScore >= 50) {
         ImGui::PopStyleColor();
     }
 
@@ -5852,15 +6199,18 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         ImGui::BeginTooltip();
         ImGui::Text("Process: %s (PID: %lu)", p.name.c_str(), p.pid);
         ImGui::Text("Parent PID: %lu", p.parentPid);
+        ImGui::Text("Automated Risk Score: %d / 100", riskScore);
         ImGui::Separator();
         ImGui::Text("Path: %s", p.exePath.c_str());
         if (!p.commandLine.empty()) {
             ImGui::Text("CommandLine: %s", p.commandLine.c_str());
         }
-        if (p.isParentSpoofed) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
-            ImGui::Text("Anomaly: %s", p.spoofingReason.c_str());
-            ImGui::PopStyleColor();
+        if (!riskFactors.empty()) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Risk Indicators:");
+            for (const auto& rf : riskFactors) {
+                ImGui::BulletText("%s", rf.c_str());
+            }
         }
         ImGui::EndTooltip();
     }
@@ -6259,16 +6609,26 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
     ImGui::TableSetColumnIndex(1); 
     ImGui::Text("%lu", p.pid);    
 
-    ImGui::TableSetColumnIndex(2); 
-    ImGui::Text("%.1f%%", p.cpuUsage);
+    ImGui::TableSetColumnIndex(2);
+    if (riskScore >= 50) {
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%d (HIGH)", riskScore);
+    } else if (riskScore > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%d (MED)", riskScore);
+    } else {
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%d (LOW)", riskScore);
+    }
 
     ImGui::TableSetColumnIndex(3); 
+    ImGui::Text("%.1f%%", p.cpuUsage);
+
+    ImGui::TableSetColumnIndex(4); 
     ImGui::Text("%.1f MB", (double)p.workingSetSize / (1024.0 * 1024.0));
 
-    ImGui::TableSetColumnIndex(4);
+    ImGui::TableSetColumnIndex(5);
+    prio_render:
     ImGui::Text("%s", p.priorityStr.c_str());
 
-    ImGui::TableSetColumnIndex(5);
+    ImGui::TableSetColumnIndex(6);
     if (p.isParentSpoofed) {
         ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "[!] SPOOFED");
         if (ImGui::IsItemHovered()) {
@@ -6278,7 +6638,7 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "OK");
     }
 
-    ImGui::TableSetColumnIndex(6);
+    ImGui::TableSetColumnIndex(7);
     if (p.exePath == "N/A" || p.exePath.empty()) {
         ImGui::TextDisabled("N/A");
     } else if (p.isSigned) {
@@ -6287,17 +6647,17 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Unsigned");
     }
     
-    ImGui::TableSetColumnIndex(7); 
+    ImGui::TableSetColumnIndex(8); 
     ImGui::Text("%s", p.exePath.c_str());
 
     if (isOpen) {
         for (const auto& child : p.children) {
             RenderProcessTreeRow(child, filterStr, selectedPid, hwnd, memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                               modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                               connectionsPid, showConnections, cachedConnections, connectionsError,
-                               handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
-                               cachedProcesses,
-                               monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
+                                modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                                connectionsPid, showConnections, cachedConnections, connectionsError,
+                                handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                                cachedProcesses,
+                                monitoredPidRef, hMonitoredProcessRef, isTrackingRef, liveCpuHist, liveMemHist, liveHistIndex, lastLiveTickRef);
         }
         ImGui::TreePop();
     }
@@ -7052,6 +7412,219 @@ std::vector<GlassTheme> LoadThemesFromFile() {
     return themes;
 }
 
+void ExportSmartTriageHtmlReport(const std::vector<SecurityFinding>& findings) {
+    if (findings.empty()) return;
+
+    OPENFILENAMEA ofn;
+    char szFile[260] = "SmartTriage_Report.html";
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "HTML Files\0*.html\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+
+    if (GetSaveFileNameA(&ofn) == TRUE) {
+        std::ofstream htmlFile(ofn.lpstrFile);
+        if (htmlFile.is_open()) {
+            htmlFile << "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
+            htmlFile << "<meta charset=\"UTF-8\">\n<title>Forensic Task Manager - Smart Triage Report</title>\n";
+            htmlFile << "<style>\n";
+            htmlFile << "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0d1117; color: #c9d1d9; margin: 0; padding: 25px; }\n";
+            htmlFile << ".container { max-width: 1600px; margin: auto; }\n";
+            htmlFile << "header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; padding-bottom: 15px; margin-bottom: 20px; }\n";
+            htmlFile << "h1 { color: #58a6ff; margin: 0; font-size: 22px; }\n";
+            htmlFile << "h3 { color: #58a6ff; margin-top: 0; font-size: 16px; border-bottom: 1px solid #30363d; padding-bottom: 8px; }\n";
+            htmlFile << ".search-box { background: #161b22; border: 1px solid #30363d; color: #c9d1d9; padding: 8px 15px; border-radius: 6px; width: 280px; font-size: 14px; outline: none; }\n";
+            htmlFile << ".search-box:focus { border-color: #58a6ff; }\n";
+            htmlFile << ".summary { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }\n";
+            htmlFile << ".card-summary { background: #161b22; border: 1px solid #30363d; padding: 10px 18px; border-radius: 8px; font-size: 13px; display: flex; align-items: center; gap: 6px; }\n";
+            
+            htmlFile << ".main-layout { display: flex; gap: 25px; align-items: flex-start; }\n";
+            htmlFile << ".content-area { flex: 2; }\n";
+            htmlFile << ".sidebar { flex: 1; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; position: sticky; top: 25px; max-height: 85vh; overflow-y: auto; }\n";
+            
+            htmlFile << ".grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; }\n";
+            htmlFile << ".card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); transition: transform 0.2s; }\n";
+            htmlFile << ".card:hover { border-color: #8b949e; }\n";
+            htmlFile << ".card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; border-bottom: 1px solid #30363d; padding-bottom: 6px; }\n";
+            htmlFile << ".badge { padding: 3px 6px; border-radius: 4px; font-weight: bold; font-size: 10px; text-transform: uppercase; }\n";
+            htmlFile << ".badge-critical { background: rgba(248,81,73,0.2); color: #f85149; border: 1px solid #f85149; }\n";
+            htmlFile << ".badge-high { background: rgba(219,109,40,0.2); color: #db6d28; border: 1px solid #db6d28; }\n";
+            htmlFile << ".badge-medium { background: rgba(210,153,34,0.2); color: #d29922; border: 1px solid #d29922; }\n";
+            htmlFile << ".badge-low { background: rgba(56,139,253,0.2); color: #388bfd; border: 1px solid #388bfd; }\n";
+            htmlFile << "ul { padding-left: 16px; margin: 0; }\n";
+            htmlFile << "li { margin-bottom: 10px; font-size: 13px; }\n";
+            htmlFile << ".mitre { color: #58a6ff; font-family: monospace; font-weight: bold; background: rgba(88,166,255,0.1); padding: 2px 4px; border-radius: 4px; text-decoration: none; }\n";
+            htmlFile << ".mitre:hover { text-decoration: underline; background: rgba(88,166,255,0.25); }\n";
+            htmlFile << ".desc { color: #8b949e; font-size: 12px; margin-top: 3px; line-height: 1.3; }\n";
+            
+            htmlFile << ".mitre-sidebar-list { list-style: none; padding: 0; margin: 0; }\n";
+            htmlFile << ".mitre-sidebar-item { margin-bottom: 15px; border-bottom: 1px solid #30363d; padding-bottom: 12px; }\n";
+            htmlFile << ".mitre-sidebar-item:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }\n";
+            htmlFile << ".mitre-title { font-weight: 600; color: #c9d1d9; font-size: 13px; margin-top: 4px; }\n";
+            htmlFile << ".mitre-text { color: #8b949e; font-size: 12px; margin-top: 3px; line-height: 1.4; }\n";
+            htmlFile << "</style>\n</head>\n<body>\n<div class=\"container\">\n";
+            
+            htmlFile << "<header>\n";
+            htmlFile << "<h1>Forensic Task Manager &mdash; Smart Triage Report</h1>\n";
+            htmlFile << "<input type=\"text\" id=\"searchInput\" class=\"search-box\" placeholder=\"Filter by PID, MITRE or title...\" onkeyup=\"filterCards()\">\n";
+            htmlFile << "</header>\n";
+
+            std::map<DWORD, std::vector<SecurityFinding>> exportMap;
+            for (const auto& f : findings) exportMap[f.targetPid].push_back(f);
+
+            int totalCritical = 0, totalHigh = 0, totalMedium = 0;
+            for (auto& pair : exportMap) {
+                int maxSev = 0;
+                for (const auto& f : pair.second) if (f.severityLevel > maxSev) maxSev = f.severityLevel;
+                if (maxSev == 4) totalCritical++;
+                else if (maxSev == 3) totalHigh++;
+                else if (maxSev == 2) totalMedium++;
+            }
+
+            htmlFile << "<div class=\"summary\">\n";
+            htmlFile << "<div class=\"card-summary\"><strong>Flagged Processes:</strong> " << exportMap.size() << "</div>\n";
+            htmlFile << "<div class=\"card-summary\"><span style=\"color:#f85149\">&#9679;</span> <strong>Critical:</strong> " << totalCritical << "</div>\n";
+            htmlFile << "<div class=\"card-summary\"><span style=\"color:#db6d28\">&#9679;</span> <strong>High:</strong> " << totalHigh << "</div>\n";
+            htmlFile << "<div class=\"card-summary\"><span style=\"color:#d29922\">&#9679;</span> <strong>Medium:</strong> " << totalMedium << "</div>\n";
+            htmlFile << "<div class=\"card-summary\"><strong>Total Findings:</strong> " << findings.size() << "</div>\n";
+            htmlFile << "</div>\n";
+
+            htmlFile << "<div class=\"main-layout\">\n";
+
+            htmlFile << "<div class=\"content-area\">\n";
+            htmlFile << "<div class=\"grid\" id=\"cardGrid\">\n";
+            for (auto& pair : exportMap) {
+                DWORD pid = pair.first;
+                const auto& pFindings = pair.second;
+                if (pFindings.empty()) continue;
+
+                int maxSev = 0;
+                for (const auto& f : pFindings) if (f.severityLevel > maxSev) maxSev = f.severityLevel;
+
+                std::string badgeClass = "badge-low";
+                std::string sevName = "LOW";
+                if (maxSev == 4) { badgeClass = "badge-critical"; sevName = "CRITICAL"; }
+                else if (maxSev == 3) { badgeClass = "badge-high"; sevName = "HIGH"; }
+                else if (maxSev == 2) { badgeClass = "badge-medium"; sevName = "MEDIUM"; }
+
+                htmlFile << "<div class=\"card\" data-search=\"pid:" << pid;
+                for (const auto& f : pFindings) {
+                    htmlFile << " " << f.mitreTag << " " << f.title << " " << f.description;
+                }
+                htmlFile << "\">\n";
+
+                htmlFile << "<div class=\"card-header\">\n";
+                htmlFile << "<div><span class=\"badge " << badgeClass << "\">" << sevName << "</span> &nbsp;<strong>PID: " << pid << "</strong></div>\n";
+                htmlFile << "<div style=\"font-size: 11px; color: #8b949e;\">Findings: " << pFindings.size() << "</div>\n";
+                htmlFile << "</div>\n<ul>\n";
+
+                for (const auto& f : pFindings) {
+                    std::string mitreTagClean = f.mitreTag;
+                    size_t dotPos = mitreTagClean.find('.');
+                    if (dotPos != std::string::npos) {
+                        mitreTagClean[dotPos] = '/';
+                    }
+                    std::string mitreUrl = "https://attack.mitre.org/techniques/" + mitreTagClean + "/";
+
+                    htmlFile << "<li><a class=\"mitre\" href=\"" << mitreUrl << "\" target=\"_blank\">[" << f.mitreTag << "]</a> " << f.title;
+                    htmlFile << "<div class=\"desc\">" << f.description << "</div></li>\n";
+                }
+                htmlFile << "</ul>\n</div>\n";
+            }
+            htmlFile << "</div>\n";
+            htmlFile << "</div>\n";
+
+            htmlFile << "<div class=\"sidebar\">\n";
+            htmlFile << "<h3>MITRE ATT&CK&reg; Reference</h3>\n";
+            htmlFile << "<ul class=\"mitre-sidebar-list\">\n";
+            
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1036/\" target=\"_blank\">T1036</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Masquerading & Path Anomaly</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Adversaries may manipulate process names, exploit missing path mappings (N/A), or spoof critical system PIDs to evade security controls.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1036/003/\" target=\"_blank\">T1036.003</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Rename Legitimate Utilities</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Adversaries may rename legitimate or system utilities to try to evade security mechanisms concerning the usage of those utilities.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1059/\" target=\"_blank\">T1059</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Command and Scripting Interpreter</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Detects command and scripting interpreters running from unauthorized or volatile user drop folders.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1059/001/\" target=\"_blank\">T1059.001</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Command and Scripting Interpreter: PowerShell</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Flags command-line invocations containing suspicious obfuscation indicators, encoded payloads, or risky utilities.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1053/\" target=\"_blank\">T1053</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Scheduled Task / Job</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Identifies processes attempting persistence registration via scheduled tasks, services, or registry run keys.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1189/\" target=\"_blank\">T1189</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Drive-by Compromise</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Detects web browsers (Edge, Chrome, Firefox) spawning child command shells like cmd.exe or powershell.exe.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1055/\" target=\"_blank\">T1055</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Process Injection</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Locates executable memory regions containing write permissions (RWX) outside standard safe program paths.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1204/\" target=\"_blank\">T1204</a>\n";
+            htmlFile << "<div class=\"mitre-title\">User Execution</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Monitors processes executing directly from volatile or user-controlled high-risk paths like AppData\\Local\\Temp.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "<li class=\"mitre-sidebar-item\">\n";
+            htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1071/\" target=\"_blank\">T1071</a>\n";
+            htmlFile << "<div class=\"mitre-title\">Application Layer Protocol</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Correlates running processes maintaining active external network communication channels with remote addresses.</div>\n";
+            htmlFile << "</li>\n";
+
+            htmlFile << "</ul>\n";
+            htmlFile << "</div>\n"; 
+
+            htmlFile << "</div>\n"; 
+
+            htmlFile << "<script>\n";
+            htmlFile << "function filterCards() {\n";
+            htmlFile << "  let input = document.getElementById('searchInput').value.toLowerCase();\n";
+            htmlFile << "  let cards = document.getElementsByClassName('card');\n";
+            htmlFile << "  for (let i = 0; i < cards.length; i++) {\n";
+            htmlFile << "    let text = cards[i].getAttribute('data-search').toLowerCase();\n";
+            htmlFile << "    if (text.includes(input)) {\n";
+            htmlFile << "      cards[i].style.display = \"block\";\n";
+            htmlFile << "    } else {\n";
+            htmlFile << "      cards[i].style.display = \"none\";\n";
+            htmlFile << "    }\n";
+            htmlFile << "  }\n";
+            htmlFile << "}\n";
+            htmlFile << "</script>\n";
+
+            htmlFile << "</div>\n</body>\n</html>";
+            htmlFile.close();
+        }
+    }
+}
+
 void ApplyGlassmorphismTheme(float alpha, ImVec4 accentColor, ImVec4 bgColor) {
     ImGuiStyle& style = ImGui::GetStyle();
     ImVec4* colors = style.Colors;
@@ -7585,7 +8158,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             sprintf_s(cpuBuffer, "CPU: %.1f%%", cachedCpu);
             std::string cpuUsageStr = cpuBuffer;
 
-            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.6 Release";
+            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.7 Release";
             float textWidth = ImGui::CalcTextSize(statusText.c_str()).x;
             float availableWidth = ImGui::GetContentRegionAvail().x;
             if (availableWidth > textWidth) {
@@ -7608,7 +8181,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             "Event Logs", "Artifact Scanner", "Network Connections", "Installed Apps", 
             "Windows Services", "Scheduled Tasks", "DLL Dependency Viewer", 
             "Startup Applications", "Environment Variables", "Locked Handles", 
-            "Dump Analyzer", "Live Tracker", "Tech Toolbox", "Hardware Specs", "Logon Sessions"
+            "Dump Analyzer", "Live Tracker", "Tech Toolbox", "Hardware Specs", "Logon Sessions",  "Smart Triaje"
         };
 
         if (!showSidebar) {
@@ -7644,7 +8217,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Spacing();
 
             ImGui::TextDisabled("MONITORING");
-            int monitoringTabs[] = { 0, 25, 1, 4, 23, 5, 6 };
+            int monitoringTabs[] = { 0, 25, 1, 27, 4, 23, 5, 6 };
             for (int idx : monitoringTabs) {
                 if (ImGui::Selectable(tabNames[idx], currentTab == idx)) {
                     currentTab = idx;
@@ -8818,6 +9391,149 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
+            if (ImGui::BeginTabItem("Smart Triaje", NULL, (currentTab == 27 ? itemFlags : 0))) {
+                static std::vector<SecurityFinding> cachedFindings;
+                static bool triageScanned = false;
+                static char triageSearchFilter[128] = "";
+
+                if (ImGui::Button("Run Automated Smart Scan")) {
+                    cachedFindings = RunSmartTriage(cachedProcesses, cachedConnections);
+                    triageScanned = true;
+                }
+                
+                ImGui::SameLine();
+                if (ImGui::Button("Clear Results")) {
+                    cachedFindings.clear();
+                    triageScanned = false;
+                }
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(250);
+                ImGui::InputText("Filter Findings", triageSearchFilter, IM_ARRAYSIZE(triageSearchFilter));
+
+                if (triageScanned && !cachedFindings.empty()) {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Export HTML Report")) {
+                        ExportSmartTriageHtmlReport(cachedFindings);
+                    }
+                }
+
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                if (!triageScanned) {
+                    ImGui::TextDisabled("[i] Click 'Run Automated Smart Scan' to evaluate system telemetry for anomalies.");
+                } else if (cachedFindings.empty()) {
+                    ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "[+] Clean system state! No high-risk security heuristics triggered.");
+                } else {
+                    std::map<DWORD, std::vector<SecurityFinding>> findingsByPid;
+                    for (const auto& finding : cachedFindings) {
+                        findingsByPid[finding.targetPid].push_back(finding);
+                    }
+
+                    ImGui::Text("Total Processes Flagged: %zu (Total Findings: %zu)", findingsByPid.size(), cachedFindings.size());
+                    ImGui::Spacing();
+
+                    ImGui::BeginChild("TriageGridScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+                    int columns = 3;
+                    ImGuiTableFlags gridFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV;
+
+                    if (ImGui::BeginTable("TriageCardsGrid", columns, gridFlags)) {
+                        
+                        for (auto& pair : findingsByPid) {
+                            DWORD pid = pair.first;
+                            const auto& pFindings = pair.second;
+                            if (pFindings.empty()) continue;
+                            if (strlen(triageSearchFilter) > 0) {
+                                bool matchFound = false;
+                                std::string filterLower = triageSearchFilter;
+                                std::transform(filterLower.begin(), filterLower.end(), filterLower.begin(), ::tolower);
+
+                                for (const auto& f : pFindings) {
+                                    std::string searchable = f.title + " " + f.description + " " + f.mitreTag + " " + std::to_string(pid);
+                                    std::transform(searchable.begin(), searchable.end(), searchable.begin(), ::tolower);
+                                    if (searchable.find(filterLower) != std::string::npos) {
+                                        matchFound = true;
+                                        break;
+                                    }
+                                }
+                                if (!matchFound) continue;
+                            }
+
+                            size_t maxSeverity = 0;
+                            for (const auto& f : pFindings) {
+                                if (f.severityLevel > (int)maxSeverity) {
+                                    maxSeverity = f.severityLevel;
+                                }
+                            }
+
+                            ImVec4 headerColor = ImVec4(0.4f, 0.8f, 1.0f, 1.0f);
+                            std::string severityStr = "LOW";
+                            if (maxSeverity == 4) {
+                                headerColor = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);
+                                severityStr = "CRITICAL";
+                            } else if (maxSeverity == 3) {
+                                headerColor = ImVec4(1.0f, 0.5f, 0.1f, 1.0f);
+                                severityStr = "HIGH";
+                            } else if (maxSeverity == 2) {
+                                headerColor = ImVec4(1.0f, 0.9f, 0.2f, 1.0f);
+                                severityStr = "MEDIUM";
+                            } else if (maxSeverity == 1) {
+                                headerColor = ImVec4(0.4f, 0.8f, 1.0f, 1.0f);
+                                severityStr = "LOW";
+                            }
+
+                            ImGui::TableNextColumn();
+
+                            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f, 0.16f, 0.20f, 0.7f));
+                            char cardId[64];
+                            snprintf(cardId, sizeof(cardId), "ProcessCard_%lu", pid);
+                            
+                            if (ImGui::BeginChild(cardId, ImVec2(0, 270), true, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+                                
+                                ImGui::TextColored(headerColor, "[%s]", severityStr.c_str());
+                                ImGui::SameLine();
+                                ImGui::Text("PID: %lu", pid);
+                                
+                                ImGui::SameLine(ImGui::GetWindowWidth() - 95);
+                                char actionLabel[32];
+                                snprintf(actionLabel, sizeof(actionLabel), "Select##%lu", pid);
+                                if (ImGui::SmallButton(actionLabel)) {
+                                    selectedPid = pid;
+                                }
+
+                                ImGui::Separator();
+                                ImGui::Spacing();
+
+                                for (size_t i = 0; i < pFindings.size(); ++i) {
+                                    const auto& finding = pFindings[i];
+                                    ImGui::BulletText("[%s] %s", finding.mitreTag.c_str(), finding.title.c_str());
+                                    
+                                    ImGui::Indent(15.0f);
+                                    ImGui::TextWrapped("%s", finding.description.c_str());
+                                    ImGui::Unindent(15.0f);
+                                    
+                                    if (i < pFindings.size() - 1) {
+                                        ImGui::Spacing();
+                                    }
+                                }
+                            }
+                            ImGui::EndChild();
+                            ImGui::PopStyleColor();
+
+                            ImGui::Spacing();
+                        }
+
+                        ImGui::EndTable();
+                    }
+
+                    ImGui::EndChild();
+                }
+
+                ImGui::EndTabItem();
+            }
+
             // TAB USB HISTORY
             if (ImGui::BeginTabItem("USB History", NULL, (currentTab == 2 ? itemFlags : 0))) {
                 ImGui::Spacing();
@@ -8881,9 +9597,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::Spacing();
                 float tableHeight = (float)winHeight - 190.0f;
 
-                if (ImGui::BeginTable("ProcessTable", 8, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
+                if (ImGui::BeginTable("ProcessTable", 9, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
                     ImGui::TableSetupColumn("NAME", ImGuiTableColumnFlags_WidthStretch, 2.0f);
                     ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+                    ImGui::TableSetupColumn("RISK", ImGuiTableColumnFlags_WidthFixed, 75.0f);
                     ImGui::TableSetupColumn("CPU (%)", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("MEMORY (MB)", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                     ImGui::TableSetupColumn("PRIORITY", ImGuiTableColumnFlags_WidthFixed, 90.0f);
@@ -8897,13 +9614,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                     for (const auto& p : cachedProcesses) {
                         RenderProcessTreeRow(p, filterStr, selectedPid, hwnd, 
-                                            memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                                            modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                            connectionsPid, showConnections, cachedConnections, connectionsError,
-                                            handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
-                                            cachedProcesses,
-                                            monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick
-                                            );
+                                                memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
+                                                modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                                                connectionsPid, showConnections, cachedConnections, connectionsError,
+                                                handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                                                cachedProcesses,
+                                                monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick
+                                                );
                     }
                     ImGui::EndTable();
                 }
