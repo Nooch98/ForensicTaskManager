@@ -4,7 +4,7 @@
 
 ## Technical Overview & Architecture
 
-Forensic Task Manager is a custom Windows diagnostic utility that bridges low-level operating system APIs with an accelerated immediate-mode graphical user interface (GUI).
+Forensic Task Manager is a custom Windows diagnostic utility and process analysis utility that bridges low-level operating system APIs with an accelerated immediate-mode graphical user interface (GUI).
 
 - **UI Framework:** [Dear ImGui](https://github.com/ocornut/imgui) (Docking branch enabled) utilizing a custom skinning layer to achieve a dynamic Glassmorphism aesthetic.
 - **Graphics Backend:** OpenGL 3.0+ initialized directly through the Win32 window context (`wglCreateContext`).
@@ -14,6 +14,18 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
 
 ## Core Features
 
+- **Automated Smart Triage Engine:**
+  * **Multi-Vector Threat Analysis:** Evaluates system telemetry against dynamic heuristics to isolate malicious behaviors and anomalies on the fly.
+  * **Strict Parent-Child Hierarchy Enforcement (`T1036`):** Validates mandatory system lineage for critical binaries (`lsass.exe`, `svchost.exe`, `wininit.exe`, `csrss.exe`, `explorer.exe`, `services.exe`) regardless of executable path visibility.
+  * **Pathless Process Refinement (`N/A`):** Eliminates false positives from kernel/session-protected system processes while flagging unauthorized pathless user binaries.
+  * **System Binary Masquerading (`T1036.003`):** Detects core system binaries executing outside `C:\Windows\System32\`.
+  * **Volatile Directory & Script Execution (`T1059` / `T1204`):** Flags script interpreters (`cmd.exe`, `powershell.exe`, `wscript.exe`) and binaries dropped directly into high-risk paths (`AppData\Local\Temp`, `Downloads`, `Public`).
+  * **CLI Obfuscation & Persistence (`T1059.001` / `T1053`):** Highlights encoded PowerShell commands (`-enc`), execution string injections (`iex`, `downloadstring`), shadow copy deletions, and unauthorized CLI persistence creation (`schtasks`, `sc create`, `reg add \Run`).
+  * **Browser-Spawned Shells (`T1189`):** Detects drive-by compromise vectors where web browsers (Edge, Chrome, Firefox) spawn command shells.
+  * **Memory Injection & RWX Tracking (`T1055`):** Identifies executable memory pages with write/execute permissions (RWX) residing outside standard program paths, with context-aware exclusions for modern JIT environments (VS Code, .NET, Node.js).
+  * **Network Socket Correlation (`T1071`):** Cross-references active ESTABLISHED sockets with remote public endpoints, categorizing non-browser/unknown process traffic with corresponding severity levels.
+  * **Responsive 3-Column Card Dashboard:** Modern ImGui grid grouping findings by process PID with severity badges (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`), PID controls, and instant search filtering.
+  * **Interactive HTML Report Export:** Generates standalone diagnostic reports complete with threat summary metrics, real-time JavaScript card filters, and an integrated MITRE ATT&CK® reference sidebar dictionary.
 - **Glassmorphic UI Engine & Theme Customizer:** Real-time adjustable transparency slider, custom built-in **Theme Editor**, and external configuration loader with persistent state saving.
 - **Real-time Performance Graphs & Benchmarking System:**
   * **Live Tracker:** Custom historical ring-buffers tracking global and per-core CPU, RAM, GPU, Disk I/O, and Network adapters activity.
@@ -29,9 +41,8 @@ Forensic Task Manager is a custom Windows diagnostic utility that bridges low-le
   * **Detailed Forensic Reports:** Generates full detailed reports using all accumulated system events and security logs.
   * **Real-Time On-Demand Scan (`MpScan`):** Triggers direct live system scans leveraging native Microsoft Defender scanning APIs (`MpScan`).
 - **Advanced Process Inspector & Forensics:**
+  * **Process Table Risk Scoring Column (`RISK`):** Dynamic 0–100 threat assessment column with color-coded severity badges (`HIGH` red, `MED` amber, `LOW` green) and an interactive diagnostic inspector tooltip detailing specific risk factors on hover.
   * **Parent Spoofing & Anomaly Detection:** Cross-references process paths and core parent hierarchies to flag process mimicry or unauthorized user-space binaries spawned by critical system parents, visually highlighting compromised nodes in the process tree with color-coded alerts.
-  
-  https://github.com/user-attachments/assets/665ccd5b-ba0f-4dc0-b842-5028e8f9eebb
   * **Advanced Hover Tooltips & Online Lookup:** Instant preview of process metadata on mouse-over, detailing PIDs, paths, command-line arguments, alongside one-click web search capabilities.
   * **Memory Injection & Anomaly Detection:** Scans process memory space for indicators of compromise, such as unbacked executable regions, anomalous protection states, or cross-process handles indicative of DLL/shellcode injection.
   * **Handles & Advanced DLLs Inspector:** Asynchronous background extraction of process handles via native NT APIs alongside deep module validation and linked DLL viewer integrations.
@@ -149,9 +160,9 @@ If you prefer to compile `libyara` manually from source, open your **MSYS2 UCRT6
 
 1. Install the required build toolchain and dependencies:
   ```bash
-  pacman -S --needed base-devel mingw-w64-ucrt-x86_64-toolchain \
-                    mingw-w64-ucrt-x86_64-yara \
-                    mingw-w64-ucrt-x86_64-openssl
+   pacman -S --needed base-devel mingw-w64-ucrt-x86_64-toolchain \
+                      mingw-w64-ucrt-x86_64-yara \
+                      mingw-w64-ucrt-x86_64-openssl
   ```
 2. Navigate to you YARA source directory and configure/compile the library:
   ```bash
@@ -182,11 +193,8 @@ To avoid manual configuration or heavy IDE setups, you can use the automated Pow
     ```bash
     Set-ExecutionPolicy Unrestricted -Scope Process
     ```
-4. Edit Paths on build.ps1
 
-<img width="542" height="326" alt="imagen" src="https://github.com/user-attachments/assets/0fc069e8-de70-437c-aeff-ae88420359fc" />
-
-6. Run the build script:
+4. Run the build script:
     ```bash
     .\build.ps1
     ```
