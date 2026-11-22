@@ -155,6 +155,8 @@ struct ProcessInfo {
     bool isParentSpoofed = false;
     bool isSigned;
     std::string spoofingReason = "";
+    bool isHidden = false;
+    std::vector<std::string> privileges;
     std::vector<ProcessInfo> children;
 };
 
@@ -178,6 +180,8 @@ struct ThreadInfoItem {
     DWORD tid;
     DWORD ownerPid;
     LONG basePri;
+    uint64_t startAddress;
+    bool isSuspicious;
 };
 
 struct ConnectionInfoItem {
@@ -470,6 +474,7 @@ struct USBHistoryEntry {
     std::string serialNumber;
     std::string friendlyName;
     std::string installDate;
+    bool isConnected = false;
 };
 std::vector<USBHistoryEntry> cachedUSBHistory;
 
@@ -530,6 +535,90 @@ struct SecurityFinding {
     std::string mitreTag;
 };
 
+struct SectorAnalysisResult {
+    bool success;
+    int badSectorsCount;
+    unsigned long long totalSectors;
+    double totalCapacityGB;
+    DWORD sectorSize;
+    std::string message;
+};
+
+struct DumpedImageEntry {
+    std::string fileName;
+    std::string fullPath;
+    uintmax_t fileSizeBytes = 0;
+    double sizeMB = 0.0;
+    std::string lastWriteStr;
+    std::string detectedType;
+};
+
+struct UpdateCheckResult {
+    bool success = false;
+    bool updateAvailable = false;
+    std::string currentVersionRaw;
+    std::string latestTag;
+    std::string latestReleaseName;
+    std::string downloadUrl;
+    std::string statusMessage;
+};
+
+struct USBPartitionInfo {
+    DWORD partitionNumber = 0;
+    ULONGLONG startingOffset = 0;
+    ULONGLONG partitionLength = 0;
+    double sizeGB = 0.0;
+    std::string styleName;
+};
+
+struct ImageFsEntry {
+    std::string name;
+    std::string fullPath;
+    bool isDirectory = false;
+    uint64_t sizeBytes = 0;
+    uint32_t firstCluster = 0;
+    bool noFatChain = false;
+};
+
+struct ImageFsContext {
+    enum class FsType { Unknown, Fat16, Fat32, ExFat };
+
+    std::string imagePath;
+    uint64_t partitionOffset = 0;
+    FsType fsType = FsType::Unknown;
+
+    uint32_t bytesPerSector = 512;
+    uint32_t sectorsPerCluster = 1;
+    uint32_t bytesPerCluster = 512;
+
+    // FAT16 / FAT32
+    uint64_t fatOffsetBytes = 0;
+    uint64_t rootDirOffsetBytes = 0;
+    uint32_t rootDirSectors = 0;
+    uint64_t dataRegionOffsetBytes = 0;
+    uint32_t rootCluster = 2;
+
+    // exFAT
+    uint64_t exfatHeapOffsetBytes = 0;
+    uint32_t exfatRootCluster = 2;
+};
+
+static uint16_t ReadU16LE(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
+static uint32_t ReadU32LE(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static uint64_t ReadU64LE(const uint8_t* p) {
+    return static_cast<uint64_t>(ReadU32LE(p)) |
+           (static_cast<uint64_t>(ReadU32LE(p + 4)) << 32);
+}
+std::string version = "v1.0.8 Release";
 std::vector<InstallerItem> g_InstallerItems;
 bool g_IsScanningInstaller = false;
 static std::unordered_map<DWORD, ProcessTimeData> g_ProcessHistory;
@@ -784,6 +873,19 @@ char editThemeNameBuffer[128] = "";
 ImVec4 editAccentColor = ImVec4(1, 1, 1, 1);
 ImVec4 editBgColor = ImVec4(0, 0, 0, 1);
 
+// USB SECTORS ANALYZE
+std::atomic<bool> isScanning(false);
+std::atomic<unsigned long long> scannedSectorsCount(0);
+std::atomic<unsigned long long> totalSectorsCount(1);
+std::atomic<int> currentBadSectors(0);
+std::string scanStatusMessage = "Idle";
+std::atomic<bool> isRepairingUSB(false);
+std::string usbRepairStatus = "Idle";
+constexpr STORAGE_BUS_TYPE kBusTypeUasp = static_cast<STORAGE_BUS_TYPE>(16);
+int ResolvePhysicalDriveIndex(const std::string& serialNumber);
+static std::atomic<ULONGLONG> dumpBytesWritten{ 0 };
+static std::atomic<ULONGLONG> dumpBytesTotal{ 0 };
+
 class BootSecurityEngine {
 #pragma pack(push, 1)
     struct MBRPartitionEntry {
@@ -992,6 +1094,97 @@ public:
         return items;
     }
 };
+
+std::string ResolveDriveLetterFromPhysicalIndex(int targetPhysicalDrive) {
+    if (targetPhysicalDrive < 0) return "";
+
+    DWORD drivesMask = GetLogicalDrives();
+    for (int letterIdx = 0; letterIdx < 26; ++letterIdx) {
+        if (!(drivesMask & (1 << letterIdx))) continue;
+
+        char letter = (char)('A' + letterIdx);
+        char volPath[16];
+        sprintf_s(volPath, sizeof(volPath), "\\\\.\\%c:", letter);
+
+        HANDLE hVol = CreateFileA(
+            volPath,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            0,
+            NULL
+        );
+
+        if (hVol == INVALID_HANDLE_VALUE) continue;
+
+        BYTE extBuffer[256] = {};
+        DWORD bytesReturned = 0;
+        VOLUME_DISK_EXTENTS* extents = (VOLUME_DISK_EXTENTS*)extBuffer;
+
+        if (DeviceIoControl(
+            hVol,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            NULL,
+            0,
+            extents,
+            sizeof(extBuffer),
+            &bytesReturned,
+            NULL))
+        {
+            for (DWORD d = 0; d < extents->NumberOfDiskExtents; ++d) {
+                if ((int)extents->Extents[d].DiskNumber == targetPhysicalDrive) {
+                    CloseHandle(hVol);
+                    std::string result(1, letter);
+                    result += ":";
+                    return result;
+                }
+            }
+        }
+
+        CloseHandle(hVol);
+    }
+
+    return "";
+}
+
+void RunUSBLogicalRepairWorker(std::string serialNumber) {
+    isRepairingUSB = true;
+    usbRepairStatus = "Resolving physical drive and volume...";
+
+    int driveIndex = ResolvePhysicalDriveIndex(serialNumber);
+    if (driveIndex < 0) {
+        usbRepairStatus = "Repair failed: physical drive not found or disconnected.";
+        isRepairingUSB = false;
+        return;
+    }
+
+    std::string driveLetter = ResolveDriveLetterFromPhysicalIndex(driveIndex);
+    if (driveLetter.empty()) {
+        usbRepairStatus = "Repair failed: no mounted drive letter found for PhysicalDrive" + std::to_string(driveIndex) + ".";
+        isRepairingUSB = false;
+        return;
+    }
+
+    usbRepairStatus = "Running CHKDSK (/f) on " + driveLetter + "...";
+
+    std::string cmd = "cmd.exe /c chkdsk " + driveLetter + " /f";
+    int exitCode = std::system(cmd.c_str());
+
+    if (exitCode == 0) {
+        usbRepairStatus = "CHKDSK completed cleanly on " + driveLetter + ".";
+    } else {
+        usbRepairStatus = "CHKDSK finished with warnings/errors on " + driveLetter + " (exit code: " + std::to_string(exitCode) + ").";
+    }
+
+    isRepairingUSB = false;
+}
+
+void StartAsyncUSBRepair(const std::string& serialNumber) {
+    if (isRepairingUSB) return;
+    std::thread worker(RunUSBLogicalRepairWorker, serialNumber);
+    worker.detach();
+}
 
 class RegistryHiveEngine {
 public:
@@ -2101,6 +2294,513 @@ bool VerifyFileSignature(const std::wstring& filePath) {
     return (status == ERROR_SUCCESS);
 }
 
+static std::vector<int> ParseVersionParts(const std::string& rawVersion) {
+    std::vector<int> parts;
+    int currentNum = -1;
+
+    for (unsigned char ch : rawVersion) {
+        if (std::isdigit(ch)) {
+            if (currentNum < 0) currentNum = 0;
+            currentNum = currentNum * 10 + (ch - '0');
+        } else {
+            if (currentNum >= 0) {
+                parts.push_back(currentNum);
+                currentNum = -1;
+            }
+        }
+    }
+    if (currentNum >= 0) {
+        parts.push_back(currentNum);
+    }
+
+    while (parts.size() < 3) {
+        parts.push_back(0);
+    }
+    return parts;
+}
+
+static int CompareVersions(const std::string& currentStr, const std::string& remoteStr) {
+    std::vector<int> cur = ParseVersionParts(currentStr);
+    std::vector<int> rem = ParseVersionParts(remoteStr);
+    size_t n = std::max(cur.size(), rem.size());
+    for (size_t i = 0; i < n; ++i) {
+        int a = (i < cur.size()) ? cur[i] : 0;
+        int b = (i < rem.size()) ? rem[i] : 0;
+        if (a < b) return -1;
+        if (a > b) return 1;
+    }
+    return 0;
+}
+
+static std::wstring ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (len <= 0) return std::wstring();
+    std::wstring ws(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &ws[0], len);
+    return ws;
+}
+
+static std::string ExtractJsonStringField(const std::string& json, const std::string& key, size_t startPos = 0) {
+    std::string pattern = "\"" + key + "\"";
+    size_t pos = json.find(pattern, startPos);
+    if (pos == std::string::npos) return "";
+
+    pos = json.find(':', pos + pattern.size());
+    if (pos == std::string::npos) return "";
+
+    pos = json.find('"', pos + 1);
+    if (pos == std::string::npos) return "";
+
+    size_t endPos = pos + 1;
+    std::string result;
+    while (endPos < json.size()) {
+        char c = json[endPos++];
+        if (c == '\\' && endPos < json.size()) {
+            char esc = json[endPos++];
+            if (esc == '"') result.push_back('"');
+            else if (esc == '\\') result.push_back('\\');
+            else if (esc == '/') result.push_back('/');
+            else if (esc == 'n') result.push_back('\n');
+            else if (esc == 'r') result.push_back('\r');
+            else if (esc == 't') result.push_back('\t');
+            else result.push_back(esc);
+        } else if (c == '"') {
+            return result;
+        } else {
+            result.push_back(c);
+        }
+    }
+    return "";
+}
+
+static std::string FindExeDownloadUrlInJson(const std::string& json, const std::string& exeName) {
+    size_t searchPos = 0;
+    while (true) {
+        std::string url = ExtractJsonStringField(json, "browser_download_url", searchPos);
+        if (url.empty()) break;
+
+        size_t lastSlash = url.find_last_of('/');
+        std::string filePart = (lastSlash != std::string::npos) ? url.substr(lastSlash + 1) : url;
+        if (filePart == exeName) {
+            return url;
+        }
+
+        size_t keyPos = json.find("\"browser_download_url\"", searchPos);
+        if (keyPos == std::string::npos) break;
+        searchPos = keyPos + 22;
+    }
+    return "";
+}
+
+static bool HttpGetAll(const std::wstring& host, const std::wstring& path, bool https, std::string& outBody, DWORD& outStatusCode) {
+    outBody.clear();
+    outStatusCode = 0;
+
+    HINTERNET hSession = WinHttpOpen(
+        L"ForensicTaskManager-Updater/1.0",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0
+    );
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(
+        hSession,
+        host.c_str(),
+        https ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT,
+        0
+    );
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect,
+        L"GET",
+        path.c_str(),
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        flags
+    );
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    WinHttpAddRequestHeaders(
+        hRequest,
+        L"Accept: application/vnd.github+json\r\nUser-Agent: ForensicTaskManager\r\n",
+        static_cast<DWORD>(-1),
+        WINHTTP_ADDREQ_FLAG_ADD
+    );
+
+    BOOL sent = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    BOOL received = sent && WinHttpReceiveResponse(hRequest, nullptr);
+
+    if (received) {
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        if (WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX
+        )) {
+            outStatusCode = statusCode;
+        }
+
+        while (true) {
+            DWORD dwSize = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+            if (dwSize == 0) break;
+
+            std::string chunk(dwSize, '\0');
+            DWORD dwDownloaded = 0;
+            if (!WinHttpReadData(hRequest, &chunk[0], dwSize, &dwDownloaded)) break;
+            if (dwDownloaded == 0) break;
+
+            chunk.resize(dwDownloaded);
+            outBody += chunk;
+        }
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return received && (outStatusCode >= 200 && outStatusCode < 300);
+}
+
+static bool ParseUrlComponents(const std::string& url, std::wstring& outHost, std::wstring& outPath, bool& outHttps) {
+    std::string prefixHttps = "https://";
+    std::string prefixHttp = "http://";
+    std::string rest;
+
+    if (url.compare(0, prefixHttps.size(), prefixHttps) == 0) {
+        outHttps = true;
+        rest = url.substr(prefixHttps.size());
+    } else if (url.compare(0, prefixHttp.size(), prefixHttp) == 0) {
+        outHttps = false;
+        rest = url.substr(prefixHttp.size());
+    } else {
+        return false;
+    }
+
+    size_t slashPos = rest.find('/');
+    std::string hostStr = (slashPos == std::string::npos) ? rest : rest.substr(0, slashPos);
+    std::string pathStr = (slashPos == std::string::npos) ? "/" : rest.substr(slashPos);
+
+    outHost = ToWide(hostStr);
+    outPath = ToWide(pathStr);
+    return !outHost.empty();
+}
+
+static bool DownloadFileHttp(const std::string& url, const std::string& destPath, std::string& outError) {
+    std::string currentUrl = url;
+    for (int redirectCount = 0; redirectCount < 6; ++redirectCount) {
+        std::wstring host, path;
+        bool https = true;
+        if (!ParseUrlComponents(currentUrl, host, path, https)) {
+            outError = "Invalid download URL: " + currentUrl;
+            return false;
+        }
+
+        HINTERNET hSession = WinHttpOpen(
+            L"ForensicTaskManager-Updater/1.0",
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            0
+        );
+        if (!hSession) {
+            outError = "WinHttpOpen failed.";
+            return false;
+        }
+
+        HINTERNET hConnect = WinHttpConnect(
+            hSession,
+            host.c_str(),
+            https ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT,
+            0
+        );
+        if (!hConnect) {
+            WinHttpCloseHandle(hSession);
+            outError = "WinHttpConnect failed.";
+            return false;
+        }
+
+        HINTERNET hRequest = WinHttpOpenRequest(
+            hConnect,
+            L"GET",
+            path.c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            https ? WINHTTP_FLAG_SECURE : 0
+        );
+        if (!hRequest) {
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            outError = "WinHttpOpenRequest failed.";
+            return false;
+        }
+
+        WinHttpAddRequestHeaders(
+            hRequest,
+            L"User-Agent: ForensicTaskManager\r\n",
+            static_cast<DWORD>(-1),
+            WINHTTP_ADDREQ_FLAG_ADD
+        );
+
+        BOOL ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                  WinHttpReceiveResponse(hRequest, nullptr);
+
+        if (!ok) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            outError = "Failed to send/receive download request.";
+            return false;
+        }
+
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX
+        );
+
+        if (statusCode == 301 || statusCode == 302 || statusCode == 303 || statusCode == 307 || statusCode == 308) {
+            DWORD locSize = 0;
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &locSize, WINHTTP_NO_HEADER_INDEX);
+            if (locSize > 0) {
+                std::wstring locBuf(locSize / sizeof(wchar_t), L'\0');
+                if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, &locBuf[0], &locSize, WINHTTP_NO_HEADER_INDEX)) {
+                    while (!locBuf.empty() && locBuf.back() == L'\0') locBuf.pop_back();
+                    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, locBuf.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                    if (utf8Len > 1) {
+                        std::string nextUrl(utf8Len - 1, '\0');
+                        WideCharToMultiByte(CP_UTF8, 0, locBuf.c_str(), -1, &nextUrl[0], utf8Len, nullptr, nullptr);
+                        currentUrl = nextUrl;
+                    }
+                }
+            }
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            continue;
+        }
+
+        if (statusCode < 200 || statusCode >= 300) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            outError = "Download HTTP error: " + std::to_string(statusCode);
+            return false;
+        }
+
+        std::ofstream outFile(destPath, std::ios::binary);
+        if (!outFile.is_open()) {
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            outError = "Cannot open destination file: " + destPath;
+            return false;
+        }
+
+        ULONGLONG totalWritten = 0;
+        while (true) {
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(hRequest, &avail)) break;
+            if (avail == 0) break;
+
+            std::vector<char> buf(avail);
+            DWORD read = 0;
+            if (!WinHttpReadData(hRequest, buf.data(), avail, &read)) break;
+            if (read == 0) break;
+
+            outFile.write(buf.data(), read);
+            if (!outFile.good()) {
+                outFile.close();
+                WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hConnect);
+                WinHttpCloseHandle(hSession);
+                outError = "Disk write error while saving update.";
+                return false;
+            }
+            totalWritten += read;
+        }
+
+        outFile.close();
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+
+        if (totalWritten == 0) {
+            outError = "Downloaded file is empty.";
+            return false;
+        }
+        return true;
+    }
+
+    outError = "Too many redirects while downloading update.";
+    return false;
+}
+
+UpdateCheckResult CheckGitHubUpdate(const std::string& currentVersionStr) {
+    UpdateCheckResult res;
+    res.currentVersionRaw = currentVersionStr;
+
+    std::string body;
+    DWORD statusCode = 0;
+    bool ok = HttpGetAll(
+        L"api.github.com",
+        L"/repos/Nooch98/ForensicTaskManager/releases/latest",
+        true,
+        body,
+        statusCode
+    );
+
+    if (!ok || body.empty()) {
+        res.success = false;
+        res.statusMessage = "Failed to check GitHub releases (HTTP " + std::to_string(statusCode) + ").";
+        return res;
+    }
+
+    std::string tagName = ExtractJsonStringField(body, "tag_name");
+    std::string releaseName = ExtractJsonStringField(body, "name");
+    std::string assetUrl = FindExeDownloadUrlInJson(body, "ForensicTaskManager.exe");
+
+    std::string remoteVersionCandidate = !releaseName.empty() ? releaseName : tagName;
+    if (remoteVersionCandidate.empty() && !tagName.empty()) {
+        remoteVersionCandidate = tagName;
+    }
+
+    if (assetUrl.empty() && !tagName.empty()) {
+        assetUrl = "https://github.com/Nooch98/ForensicTaskManager/releases/download/" + tagName + "/ForensicTaskManager.exe";
+    }
+
+    res.success = true;
+    res.latestTag = tagName;
+    res.latestReleaseName = releaseName;
+    res.downloadUrl = assetUrl;
+
+    int cmp = CompareVersions(currentVersionStr, remoteVersionCandidate);
+    if (cmp < 0 && !assetUrl.empty()) {
+        res.updateAvailable = true;
+        res.statusMessage = "Update available: " + (releaseName.empty() ? tagName : releaseName);
+    } else {
+        res.updateAvailable = false;
+        res.statusMessage = "App is up to date (" + currentVersionStr + ").";
+    }
+    return res;
+}
+
+bool DownloadAndApplyUpdate(const std::string& downloadUrl, std::string& outStatusMessage, bool exitCurrentProcessAfterLaunch = true) {
+    char currentExePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, currentExePath, MAX_PATH) == 0) {
+        outStatusMessage = "Failed to get current executable path.";
+        return false;
+    }
+
+    char tempDirPath[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, tempDirPath) == 0) {
+        outStatusMessage = "Failed to get TEMP directory.";
+        return false;
+    }
+
+    std::string tempDirStr(tempDirPath);
+    if (!tempDirStr.empty() && tempDirStr.back() != '\\') {
+        tempDirStr.push_back('\\');
+    }
+
+    std::string tempExePath = tempDirStr + "ForensicTaskManager_update.exe";
+    std::string psScriptPath = tempDirStr + "ftm_apply_update.ps1";
+
+    std::string dlError;
+    if (!DownloadFileHttp(downloadUrl, tempExePath, dlError)) {
+        outStatusMessage = "Download failed: " + dlError;
+        return false;
+    }
+
+    auto escapePsSingleQuote = [](const std::string& s) {
+        std::string out = s;
+        size_t pos = 0;
+        while ((pos = out.find('\'', pos)) != std::string::npos) {
+            out.replace(pos, 1, "''");
+            pos += 2;
+        }
+        return out;
+    };
+
+    std::string psTempExe = escapePsSingleQuote(tempExePath);
+    std::string psTargetExe = escapePsSingleQuote(std::string(currentExePath));
+    std::string psScriptEscaped = escapePsSingleQuote(psScriptPath);
+
+    std::ofstream psFile(psScriptPath, std::ios::out | std::ios::trunc);
+    if (!psFile.is_open()) {
+        outStatusMessage = "Failed to create updater script.";
+        return false;
+    }
+
+    psFile << "Start-Sleep -Seconds 2\n";
+    psFile << "Copy-Item -LiteralPath '" << psTempExe << "' -Destination '" << psTargetExe << "' -Force\n";
+    psFile << "Remove-Item -LiteralPath '" << psTempExe << "' -Force -ErrorAction SilentlyContinue\n";
+    psFile << "Start-Process -FilePath '" << psTargetExe << "' -Verb RunAs\n";
+    psFile << "Remove-Item -LiteralPath '" << psScriptEscaped << "' -Force -ErrorAction SilentlyContinue\n";
+    psFile.close();
+
+    std::string cmdCommand =
+        "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + psScriptPath + "\"";
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    PROCESS_INFORMATION pi = {};
+    std::vector<char> cmdMutable(cmdCommand.begin(), cmdCommand.end());
+    cmdMutable.push_back('\0');
+
+    BOOL created = CreateProcessA(
+        nullptr,
+        cmdMutable.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi
+    );
+
+    if (!created) {
+        outStatusMessage = "Failed to launch updater process.";
+        return false;
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    outStatusMessage = "Update downloaded. Restarting ForensicTaskManager.exe as administrator...";
+    if (exitCurrentProcessAfterLaunch) {
+        ExitProcess(0);
+    }
+    return true;
+}
+
 static void AsyncFetchGeoIP(std::string target) {
     std::string ip = target;
     size_t colonPos = target.find(':');
@@ -2625,6 +3325,70 @@ std::vector<SecurityFinding> RunSmartTriage(
                     });
                 }
             }
+
+            std::string threadError;
+            std::vector<ThreadInfoItem> threads = GetProcessThreads(p.pid, threadError);
+            if (threadError.empty() && !threads.empty()) {
+                std::string modError;
+                std::vector<ModuleInfoItem> mods = GetProcessModules(p.pid, modError);
+                
+                std::string memError;
+                std::vector<MemoryRegion> memRegions = GetProcessMemoryMap(p.pid, memError);
+
+                for (const auto& th : threads) {
+                    if (th.startAddress != 0) {
+                        bool pointsToValidMemory = false;
+                        if (modError.empty()) {
+                            for (const auto& mod : mods) {
+                                uint64_t modStart = mod.baseAddress;
+                                if (th.startAddress >= modStart && th.startAddress <= (modStart + 0x03000000)) {
+                                    pointsToValidMemory = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!pointsToValidMemory && memError.empty()) {
+                            for (const auto& reg : memRegions) {
+                                uint64_t regStart = reg.baseAddress;
+                                uint64_t regEnd = regStart + reg.regionSize;
+                                if (th.startAddress >= regStart && th.startAddress < regEnd) {
+                                    if ((reg.protect & PAGE_EXECUTE) || 
+                                        (reg.protect & PAGE_EXECUTE_READ) || 
+                                        (reg.protect & PAGE_EXECUTE_READWRITE) || 
+                                        (reg.protect & PAGE_EXECUTE_WRITECOPY) ||
+                                        reg.type == MEM_PRIVATE || reg.type == MEM_IMAGE) {
+                                        pointsToValidMemory = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        bool isComplexApp = (nameLower.find("firefox") != std::string::npos ||
+                                             nameLower.find("chrome") != std::string::npos ||
+                                             nameLower.find("msedge") != std::string::npos ||
+                                             nameLower.find("steam") != std::string::npos ||
+                                             nameLower.find("ovrserver") != std::string::npos ||
+                                             nameLower.find("discord") != std::string::npos);
+
+                        if (isComplexApp || isTrustedDevTool) {
+                            pointsToValidMemory = true;
+                        }
+
+                        if (!pointsToValidMemory) {
+                            findings.push_back({
+                                "Unbacked / Injected Thread Start Address",
+                                "Thread ID " + std::to_string(th.tid) + " in process '" + p.name + "' (PID: " + std::to_string(p.pid) + 
+                                ") has a start address (0x" + std::to_string(th.startAddress) + ") pointing outside valid mapped modules. Potential unbacked thread injection.",
+                                4,
+                                p.pid,
+                                "T1055"
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         if (!isNoPath) {
@@ -3132,6 +3896,9 @@ bool IsDeviceCurrentlyConnected(const std::string& serialNumberToCheck) {
 
 std::vector<USBHistoryEntry> LoadUSBHistory() {
     std::vector<USBHistoryEntry> entries;
+    static std::unordered_map<std::string, std::string> connectedTimestamps;
+    std::unordered_map<std::string, std::string> nextConnectedTimestamps;
+
     HKEY hRootKey = nullptr;    
     std::string regPath = "SYSTEM\\CurrentControlSet\\Enum\\USBSTOR";
     
@@ -3201,13 +3968,21 @@ std::vector<USBHistoryEntry> LoadUSBHistory() {
                     }
                     
                     if (IsDeviceCurrentlyConnected(entry.serialNumber)) {
-                        SYSTEMTIME stLocal;
-                        GetLocalTime(&stLocal);
-                        char timeBuffer[64];
-                        sprintf_s(timeBuffer, sizeof(timeBuffer), "%04d-%02d-%02d %02d:%02d:%02d (Connected)",
-                                  stLocal.wYear, stLocal.wMonth, stLocal.wDay,
-                                  stLocal.wHour, stLocal.wMinute, stLocal.wSecond);
-                        entry.installDate = timeBuffer;
+                        entry.isConnected = true;
+
+                        auto it = connectedTimestamps.find(entry.serialNumber);
+                        if (it != connectedTimestamps.end()) {
+                            entry.installDate = it->second;
+                        } else if (entry.installDate == "N/A" || entry.installDate.empty()) {
+                            SYSTEMTIME stLocal;
+                            GetLocalTime(&stLocal);
+                            char timeBuffer[64];
+                            sprintf_s(timeBuffer, sizeof(timeBuffer), "%04d-%02d-%02d %02d:%02d:%02d",
+                                    stLocal.wYear, stLocal.wMonth, stLocal.wDay,
+                                    stLocal.wHour, stLocal.wMinute, stLocal.wSecond);
+                            entry.installDate = timeBuffer;
+                        }
+                        nextConnectedTimestamps[entry.serialNumber] = entry.installDate;
                     }
                     
                     entries.push_back(entry);
@@ -3217,12 +3992,67 @@ std::vector<USBHistoryEntry> LoadUSBHistory() {
         }
         RegCloseKey(hRootKey);
     }
+
+    connectedTimestamps.swap(nextConnectedTimestamps);
     
     std::sort(entries.begin(), entries.end(), [](const USBHistoryEntry& a, const USBHistoryEntry& b) {
         return a.installDate > b.installDate;
     });
 
     return entries;
+}
+
+struct SelectedUSBDetails {
+    bool resolved = false;
+    bool isConnected = false;
+    int physicalDriveIndex = -1;
+    std::string driveLetter = "N/A";
+    double capacityGB = 0.0;
+    unsigned long long totalSectors = 0;
+    DWORD sectorSize = 0;
+};
+
+SelectedUSBDetails QuerySelectedUSBDetails(const USBHistoryEntry& usb) {
+    SelectedUSBDetails details;
+    details.isConnected = usb.isConnected || IsDeviceCurrentlyConnected(usb.serialNumber);
+    if (!details.isConnected) {
+        return details;
+    }
+
+    details.physicalDriveIndex = ResolvePhysicalDriveIndex(usb.serialNumber);
+    if (details.physicalDriveIndex < 0) {
+        return details;
+    }
+
+    std::string letter = ResolveDriveLetterFromPhysicalIndex(details.physicalDriveIndex);
+    details.driveLetter = letter.empty() ? "Unmounted / RAW" : letter;
+
+    wchar_t devicePath[64];
+    swprintf_s(devicePath, 64, L"\\\\.\\PhysicalDrive%d", details.physicalDriveIndex);
+
+    HANDLE hDevice = CreateFileW(
+        devicePath,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
+
+    if (hDevice != INVALID_HANDLE_VALUE) {
+        DISK_GEOMETRY_EX geom = {};
+        DWORD bytesReturned = 0;
+        if (DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &geom, sizeof(geom), &bytesReturned, NULL)) {
+            details.sectorSize = geom.Geometry.BytesPerSector;
+            details.totalSectors = (details.sectorSize > 0) ? (geom.DiskSize.QuadPart / details.sectorSize) : 0;
+            details.capacityGB = (double)geom.DiskSize.QuadPart / (1024.0 * 1024.0 * 1024.0);
+            details.resolved = true;
+        }
+        CloseHandle(hDevice);
+    }
+
+    return details;
 }
 
 std::unordered_map<std::string, std::string> GetRegistryValuesSnapshot(HKEY hKeyRoot, const std::wstring& subKeyPath) {
@@ -5421,6 +6251,7 @@ std::vector<ProcessInfo> GetRunningProcesses() {
             info.priorityStr = "Normal";
             info.isParentSpoofed = false;
             info.isSigned = false;
+            info.isHidden = false;
 
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
             if (hProcess) {
@@ -5449,6 +6280,33 @@ std::vector<ProcessInfo> GetRunningProcesses() {
                 PROCESS_MEMORY_COUNTERS pmc;
                 if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
                     info.workingSetSize = pmc.WorkingSetSize;
+                }
+
+                HANDLE hToken = NULL;
+                if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+                    DWORD tokenInfoLength = 0;
+                    GetTokenInformation(hToken, TokenPrivileges, NULL, 0, &tokenInfoLength);
+                    if (tokenInfoLength > 0) {
+                        PTOKEN_PRIVILEGES pTokenPrivs = (PTOKEN_PRIVILEGES)malloc(tokenInfoLength);
+                        if (pTokenPrivs && GetTokenInformation(hToken, TokenPrivileges, pTokenPrivs, tokenInfoLength, &tokenInfoLength)) {
+                            for (DWORD i = 0; i < pTokenPrivs->PrivilegeCount; ++i) {
+                                if (pTokenPrivs->Privileges[i].Attributes & (SE_PRIVILEGE_ENABLED | SE_PRIVILEGE_ENABLED_BY_DEFAULT)) {
+                                    char privName[256];
+                                    DWORD privNameSize = sizeof(privName);
+                                    if (LookupPrivilegeNameA(NULL, &pTokenPrivs->Privileges[i].Luid, privName, &privNameSize)) {
+                                        std::string sPriv(privName);
+                                        if (sPriv == "SeDebugPrivilege" || sPriv == "SeImpersonatePrivilege" || 
+                                            sPriv == "SeLoadDriverPrivilege" || sPriv == "SeTcbPrivilege" || 
+                                            sPriv == "SeBackupPrivilege" || sPriv == "SeRestorePrivilege") {
+                                            info.privileges.push_back(sPriv);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (pTokenPrivs) free(pTokenPrivs);
+                    }
+                    CloseHandle(hToken);
                 }
 
                 FILETIME creationTime, exitTime, kernelTime, userTime;
@@ -5482,6 +6340,89 @@ std::vector<ProcessInfo> GetRunningProcesses() {
         } while (Process32Next(hSnap, &pe));
     }
     CloseHandle(hSnap);
+
+    typedef struct _UNICODE_STRING {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR  Buffer;
+    } UNICODE_STRING;
+
+    typedef struct _SYSTEM_PROCESS_INFORMATION {
+        ULONG NextEntryOffset;
+        ULONG NumberOfThreads;
+        LARGE_INTEGER WorkingSetPrivateSize;
+        ULONG HardFaultCount;
+        ULONG NumberOfThreadsHighWatermark;
+        ULONGLONG CycleTime;
+        LARGE_INTEGER CreateTime;
+        LARGE_INTEGER UserTime;
+        LARGE_INTEGER KernelTime;
+        UNICODE_STRING ImageName;
+        LONG BasePriority;
+        HANDLE UniqueProcessId;
+        HANDLE InheritedFromUniqueProcessId;
+        ULONG HandleCount;
+        ULONG SessionId;
+        ULONG_PTR UniqueProcessKey;
+        SIZE_T PeakVirtualSize;
+        SIZE_T VirtualSize;
+        ULONG PageFaultCount;
+        SIZE_T PeakWorkingSetSize;
+        SIZE_T WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage;
+        SIZE_T QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage;
+        SIZE_T QuotaNonPagedPoolUsage;
+        SIZE_T PageSize;
+        ULONG Flag;
+        HANDLE UniqueProcessIdHandle;
+        ULONG_PTR WorkingSetPrivateSize2;
+    } SYSTEM_PROCESS_INFORMATION;
+
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    if (hNtdll) {
+        auto NtQuerySystemInformation = (NTSTATUS(WINAPI*)(ULONG, PVOID, ULONG, PULONG))GetProcAddress(hNtdll, "NtQuerySystemInformation");
+        if (NtQuerySystemInformation) {
+            ULONG returnLength = 0;
+            NtQuerySystemInformation(5, NULL, 0, &returnLength);
+            if (returnLength > 0) {
+                std::vector<BYTE> buffer(returnLength + 4096);
+                if (NtQuerySystemInformation(5, buffer.data(), (ULONG)buffer.size(), &returnLength) >= 0) {
+                    BYTE* ptr = buffer.data();
+                    while (true) {
+                        auto spi = (SYSTEM_PROCESS_INFORMATION*)ptr;
+                        DWORD nativePid = (DWORD)(ULONG_PTR)spi->UniqueProcessId;
+
+                        if (nativePid != 0 && activePids.find(nativePid) == activePids.end()) {
+                            ProcessInfo hiddenInfo;
+                            hiddenInfo.pid = nativePid;
+                            hiddenInfo.parentPid = (DWORD)(ULONG_PTR)spi->InheritedFromUniqueProcessId;
+                            if (spi->ImageName.Buffer && spi->ImageName.Length > 0) {
+                                std::wstring wName(spi->ImageName.Buffer, spi->ImageName.Length / sizeof(WCHAR));
+                                hiddenInfo.name = std::string(wName.begin(), wName.end());
+                            } else {
+                                hiddenInfo.name = "Unknown_Hidden";
+                            }
+                            hiddenInfo.exePath = "N/A (Hidden / DKOM)";
+                            hiddenInfo.isHidden = true;
+                            hiddenInfo.isParentSpoofed = true;
+                            hiddenInfo.spoofingReason = "Process hidden from standard Toolhelp32 snapshot (DKOM / Evasion)";
+                            hiddenInfo.isSigned = false;
+                            hiddenInfo.workingSetSize = spi->WorkingSetSize;
+                            hiddenInfo.cpuUsage = 0.0f;
+                            hiddenInfo.priorityStr = "Unknown";
+
+                            flatProcesses.push_back(hiddenInfo);
+                            activePids[nativePid] = true;
+                        }
+
+                        if (spi->NextEntryOffset == 0) break;
+                        ptr += spi->NextEntryOffset;
+                    }
+                }
+            }
+        }
+    }
 
     static const std::unordered_set<std::string> criticalSystemBinaries = {
         "lsass.exe", "csrss.exe", "services.exe", "wininit.exe", 
@@ -5518,24 +6459,6 @@ std::vector<ProcessInfo> GetRunningProcesses() {
                 }
             }
         }
-
-        if (pidToNameMap.find(info.parentPid) != pidToNameMap.end()) {
-            std::string parentName = pidToNameMap[info.parentPid];
-            std::transform(parentName.begin(), parentName.end(), parentName.begin(), ::tolower);
-
-            bool isSuspiciousPath = (lowerPath.find("temp") != std::string::npos || 
-                                     lowerPath.find("appdata") != std::string::npos ||
-                                     lowerPath.find("users\\public") != std::string::npos ||
-                                     lowerPath.find("downloads") != std::string::npos);
-
-            if (info.exePath != "N/A" && isSuspiciousPath) {
-                if (parentName == "services.exe" || parentName == "wininit.exe" || 
-                    parentName == "lsass.exe" || parentName == "csrss.exe" || parentName == "smss.exe") {
-                    info.isParentSpoofed = true;
-                    info.spoofingReason = "User-space/Suspicious executable spawned by Core System Parent";
-                }
-            }
-        }
     }
 
     for (auto it = g_ProcessHistory.begin(); it != g_ProcessHistory.end();) {
@@ -5545,7 +6468,7 @@ std::vector<ProcessInfo> GetRunningProcesses() {
 
     std::thread([](std::vector<ProcessInfo> procs) {
         for (const auto& p : procs) {
-            if (p.exePath != "N/A" && !p.exePath.empty()) {
+            if (!p.isHidden && p.exePath != "N/A" && !p.exePath.empty()) {
                 std::lock_guard<std::mutex> lock(g_SignatureMutex);
                 if (g_SignatureCache.find(p.exePath) == g_SignatureCache.end()) {
                     SignatureDetails sig = CheckFileDigitalSignature(p.exePath);
@@ -6647,7 +7570,35 @@ void RenderProcessTreeRow(const ProcessInfo& p, const std::string& filterStr, DW
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Unsigned");
     }
     
-    ImGui::TableSetColumnIndex(8); 
+    ImGui::TableSetColumnIndex(8);
+    if (!p.privileges.empty()) {
+        bool hasDebug = false;
+        bool hasImpersonate = false;
+        for (const auto& pr : p.privileges) {
+            if (pr == "SeDebugPrivilege") hasDebug = true;
+            if (pr == "SeImpersonatePrivilege") hasImpersonate = true;
+        }
+
+        if (hasDebug || hasImpersonate) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.1f, 1.0f), "[!] %zu Priv(s)", p.privileges.size());
+        } else {
+            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.3f, 1.0f), "%zu Priv(s)", p.privileges.size());
+        }
+
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::Text("Active Critical Privileges (PID: %lu):", p.pid);
+            ImGui::Separator();
+            for (const auto& pr : p.privileges) {
+                ImGui::BulletText("%s", pr.c_str());
+            }
+            ImGui::EndTooltip();
+        }
+    } else {
+        ImGui::TextDisabled("None");
+    }
+
+    ImGui::TableSetColumnIndex(9); 
     ImGui::Text("%s", p.exePath.c_str());
 
     if (isOpen) {
@@ -6669,6 +7620,578 @@ size_t CountTotalProcesses(const std::vector<ProcessInfo>& processList) {
         total += CountTotalProcesses(p.children);
     }
     return total;
+}
+
+static std::string NormalizeSerial(std::string s) {
+    size_t ampPos = s.find('&');
+    if (ampPos != std::string::npos) {
+        s = s.substr(0, ampPos);
+    }
+    std::string cleaned;
+    cleaned.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c)) {
+            cleaned.push_back((char)std::tolower(c));
+        }
+    }
+    return cleaned;
+}
+
+static int HexVal(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static std::string TryDecodeHexSerial(const std::string& hexStr) {
+    if (hexStr.size() < 4 || (hexStr.size() % 2) != 0) return "";
+    std::string decoded;
+    decoded.reserve(hexStr.size() / 2);
+    for (size_t i = 0; i < hexStr.size(); i += 2) {
+        int hi = HexVal(hexStr[i]);
+        int lo = HexVal(hexStr[i + 1]);
+        if (hi < 0 || lo < 0) return "";
+        char ch = (char)((hi << 4) | lo);
+        if (std::isalnum((unsigned char)ch)) {
+            decoded.push_back((char)std::tolower((unsigned char)ch));
+        }
+    }
+    return decoded;
+}
+
+static bool SerialMatches(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    if (a == b || a.find(b) != std::string::npos || b.find(a) != std::string::npos) {
+        return true;
+    }
+    std::string decA = TryDecodeHexSerial(a);
+    std::string decB = TryDecodeHexSerial(b);
+    if (!decA.empty() && (decA == b || b.find(decA) != std::string::npos || decA.find(b) != std::string::npos)) {
+        return true;
+    }
+    if (!decB.empty() && (decB == a || a.find(decB) != std::string::npos || decB.find(a) != std::string::npos)) {
+        return true;
+    }
+    return false;
+}
+
+static std::string SanitizeFileTag(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '_' || c == '-') {
+            out.push_back((char)c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) out = "UNKNOWN";
+    return out;
+}
+
+std::string PromptSaveHTMLDialog() {
+    wchar_t szFile[MAX_PATH] = L"usb_forensic_report.html";
+    OPENFILENAMEW ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = L"HTML Files (*.html)\0*.html\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = L"html";
+
+    if (GetSaveFileNameW(&ofn) == TRUE) {
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, szFile, -1, NULL, 0, NULL, NULL);
+        std::string strTo(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, szFile, -1, &strTo[0], size_needed, NULL, NULL);
+        strTo.pop_back();
+        return strTo;
+    }
+    return "";
+}
+
+bool ExportUSBReportToHTML(const std::string& deviceSerial, const SectorAnalysisResult& analysis, bool mbrDumped) {
+    std::string filePath = PromptSaveHTMLDialog();
+    if (filePath.empty()) return false;
+
+    FILE* fp = nullptr;
+    fopen_s(&fp, filePath.c_str(), "w");
+    if (!fp) return false;
+
+    fprintf(fp, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n");
+    fprintf(fp, "<title>Forensic Task Manager - USB Analysis Report</title>\n");
+    fprintf(fp, "<style>\n");
+    fprintf(fp, "  body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }\n");
+    fprintf(fp, "  .container { max-width: 850px; margin: auto; background: #1e1e1e; padding: 30px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }\n");
+    fprintf(fp, "  h1 { color: #bb86fc; border-bottom: 2px solid #333; padding-bottom: 10px; }\n");
+    fprintf(fp, "  .card { background: #2d2d2d; padding: 15px; margin: 15px 0; border-radius: 6px; border-left: 5px solid %s; }\n", analysis.badSectorsCount == 0 ? "#03dac6" : "#cf6679");
+    fprintf(fp, "  .badge { display: inline-block; padding: 5px 10px; border-radius: 4px; font-weight: bold; background: %s; color: #000; }\n", analysis.badSectorsCount == 0 ? "#03dac6" : "#cf6679");
+    fprintf(fp, "  ul { list-style: none; padding: 0; }\n  li { padding: 8px 0; border-bottom: 1px solid #3d3d3d; }\n");
+    fprintf(fp, "</style>\n</head>\n<body>\n");
+    fprintf(fp, "<div class=\"container\">\n");
+    fprintf(fp, "  <h1>USB Forensic & Physical Geometry Report</h1>\n");
+    fprintf(fp, "  <p><strong>Generated by:</strong> Forensic Task Manager v1.0.8 (SOC Edition)</p>\n");
+    
+    fprintf(fp, "  <div class=\"card\">\n");
+    fprintf(fp, "    <h3>Device & Storage Geometry</h3>\n");
+    fprintf(fp, "    <ul>\n");
+    fprintf(fp, "      <li><strong>Serial Number / Instance ID:</strong> %s</li>\n", deviceSerial.c_str());
+    fprintf(fp, "      <li><strong>Total Capacity:</strong> %.2f GB (%.0f Bytes)</li>\n", analysis.totalCapacityGB, analysis.totalCapacityGB * 1024 * 1024 * 1024);
+    fprintf(fp, "      <li><strong>Total Sectors (LBA):</strong> %llu</li>\n", analysis.totalSectors);
+    fprintf(fp, "      <li><strong>Sector Size:</strong> %u Bytes</li>\n", analysis.sectorSize);
+    fprintf(fp, "      <li><strong>Health Status:</strong> <span class=\"badge\">%s</span></li>\n", analysis.badSectorsCount == 0 ? "HEALTHY / CLEAN" : "WARNING / DAMAGED");
+    fprintf(fp, "    </ul>\n");
+    fprintf(fp, "  </div>\n");
+
+    fprintf(fp, "  <div class=\"card\">\n");
+    fprintf(fp, "    <h3>Sector Analysis Results</h3>\n");
+    fprintf(fp, "    <p>%s</p>\n", analysis.message.c_str());
+    fprintf(fp, "    <p><strong>MBR Dump Status:</strong> %s</p>\n", mbrDumped ? "Successfully Dumped" : "Not Performed / Analysed Only");
+    fprintf(fp, "  </div>\n");
+    fprintf(fp, "  <footer style=\"text-align: center; margin-top: 30px; color: #777; font-size: 0.9em;\">Forensic Task Manager - Automated Report</footer>\n");
+    fprintf(fp, "</div>\n</body>\n</html>");
+
+    fclose(fp);
+    return true;
+}
+
+int ResolvePhysicalDriveIndex(const std::string& serialNumber) {
+    std::string targetSerial = NormalizeSerial(serialNumber);
+    if (targetSerial.empty()) return -1;
+
+    GUID diskInterfaceGuid = { 0x53f56307, 0xb6bf, 0x11d0, { 0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b } };
+
+    HDEVINFO hDevInfo = SetupDiGetClassDevsA(
+        &diskInterfaceGuid,
+        NULL,
+        NULL,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE
+    );
+
+    if (hDevInfo == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    int resolvedIndex = -1;
+    SP_DEVICE_INTERFACE_DATA ifData = {};
+    ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &diskInterfaceGuid, i, &ifData); ++i) {
+        DWORD requiredSize = 0;
+        SetupDiGetDeviceInterfaceDetailA(hDevInfo, &ifData, NULL, 0, &requiredSize, NULL);
+        if (requiredSize == 0) continue;
+
+        std::vector<BYTE> detailBuf(requiredSize);
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_A detailData =
+            reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_A>(detailBuf.data());
+        detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+
+        SP_DEVINFO_DATA devInfoData = {};
+        devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+        if (!SetupDiGetDeviceInterfaceDetailA(hDevInfo, &ifData, detailData, requiredSize, NULL, &devInfoData)) {
+            continue;
+        }
+
+        char instanceId[512] = {};
+        std::string combinedId(detailData->DevicePath);
+        if (SetupDiGetDeviceInstanceIdA(hDevInfo, &devInfoData, instanceId, sizeof(instanceId), NULL)) {
+            combinedId += " ";
+            combinedId += instanceId;
+        }
+
+        std::string normCombined = NormalizeSerial(combinedId);
+        std::string lowerCombined = combinedId;
+        std::transform(lowerCombined.begin(), lowerCombined.end(), lowerCombined.begin(), [](unsigned char c) {
+            return (char)std::tolower(c);
+        });
+
+        std::string lowerSerial = serialNumber;
+        size_t amp = lowerSerial.find('&');
+        if (amp != std::string::npos) lowerSerial = lowerSerial.substr(0, amp);
+        std::transform(lowerSerial.begin(), lowerSerial.end(), lowerSerial.begin(), [](unsigned char c) {
+            return (char)std::tolower(c);
+        });
+
+        bool matched = (!lowerSerial.empty() && lowerCombined.find(lowerSerial) != std::string::npos) ||
+                       SerialMatches(normCombined, targetSerial);
+
+        if (!matched) continue;
+
+        HANDLE hDisk = CreateFileA(
+            detailData->DevicePath,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            0,
+            NULL
+        );
+
+        if (hDisk != INVALID_HANDLE_VALUE) {
+            STORAGE_DEVICE_NUMBER sdn = {};
+            DWORD bytesReturned = 0;
+            if (DeviceIoControl(
+                hDisk,
+                IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                NULL,
+                0,
+                &sdn,
+                sizeof(sdn),
+                &bytesReturned,
+                NULL))
+            {
+                if (sdn.DeviceType == FILE_DEVICE_DISK && sdn.DeviceNumber >= 0) {
+                    resolvedIndex = static_cast<int>(sdn.DeviceNumber);
+                    CloseHandle(hDisk);
+                    break;
+                }
+            }
+            CloseHandle(hDisk);
+        }
+    }
+
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    return resolvedIndex;
+}
+
+static HANDLE OpenPhysicalDriveForRead(int driveIndex, DWORD extraFlags, DWORD& outError) {
+    outError = 0;
+    if (driveIndex < 0) {
+        outError = ERROR_NOT_FOUND;
+        return INVALID_HANDLE_VALUE;
+    }
+
+    wchar_t devicePath[64];
+    swprintf_s(devicePath, 64, L"\\\\.\\PhysicalDrive%d", driveIndex);
+
+    HANDLE hDevice = CreateFileW(
+        devicePath,
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        OPEN_EXISTING,
+        extraFlags,
+        NULL
+    );
+
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        outError = GetLastError();
+    }
+    return hDevice;
+}
+
+std::vector<USBPartitionInfo> EnumerateUSBPartitions(const std::string& serialNumber) {
+    std::vector<USBPartitionInfo> result;
+    int driveIndex = ResolvePhysicalDriveIndex(serialNumber);
+    DWORD err = 0;
+    HANDLE hDevice = OpenPhysicalDriveForRead(driveIndex, 0, err);
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        return result;
+    }
+
+    DWORD bufSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + sizeof(PARTITION_INFORMATION_EX) * 128;
+    std::vector<BYTE> layoutBuf(bufSize);
+    DWORD bytesReturned = 0;
+
+    if (DeviceIoControl(
+        hDevice,
+        IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+        NULL,
+        0,
+        layoutBuf.data(),
+        bufSize,
+        &bytesReturned,
+        NULL))
+    {
+        const DRIVE_LAYOUT_INFORMATION_EX* layout =
+            reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(layoutBuf.data());
+
+        std::string style = "Unknown";
+        if (layout->PartitionStyle == PARTITION_STYLE_MBR) style = "MBR";
+        else if (layout->PartitionStyle == PARTITION_STYLE_GPT) style = "GPT";
+
+        for (DWORD i = 0; i < layout->PartitionCount; ++i) {
+            const PARTITION_INFORMATION_EX& p = layout->PartitionEntry[i];
+            if (p.PartitionLength.QuadPart > 0 && p.PartitionNumber > 0) {
+                USBPartitionInfo info;
+                info.partitionNumber = p.PartitionNumber;
+                info.startingOffset = static_cast<ULONGLONG>(p.StartingOffset.QuadPart);
+                info.partitionLength = static_cast<ULONGLONG>(p.PartitionLength.QuadPart);
+                info.sizeGB = static_cast<double>(info.partitionLength) / (1024.0 * 1024.0 * 1024.0);
+                info.styleName = style;
+                result.push_back(info);
+            }
+        }
+    }
+
+    CloseHandle(hDevice);
+    return result;
+}
+
+bool DumpUSBMBR(const std::string& serialNumber, std::string* outFilePath = nullptr) {
+    int driveIndex = ResolvePhysicalDriveIndex(serialNumber);
+    DWORD err = 0;
+    HANDLE hDevice = OpenPhysicalDriveForRead(driveIndex, 0, err);
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    BYTE mbrBuffer[512] = {};
+    DWORD bytesRead = 0;
+    LARGE_INTEGER zeroOffset = {};
+    SetFilePointerEx(hDevice, zeroOffset, NULL, FILE_BEGIN);
+    BOOL success = ReadFile(hDevice, mbrBuffer, sizeof(mbrBuffer), &bytesRead, NULL);
+    CloseHandle(hDevice);
+
+    if (!success || bytesRead != 512) {
+        return false;
+    }
+
+    std::string fileName = "mbr_pd" + std::to_string(driveIndex) + "_" + SanitizeFileTag(serialNumber) + ".bin";
+    std::ofstream outFile(fileName, std::ios::binary);
+    if (!outFile.is_open()) {
+        return false;
+    }
+
+    outFile.write(reinterpret_cast<const char*>(mbrBuffer), 512);
+    outFile.close();
+
+    if (outFilePath) {
+        *outFilePath = fileName;
+    }
+    return true;
+}
+
+bool DumpUSBPartition(const std::string& serialNumber, DWORD targetPartitionNumber, std::string* outFilePath = nullptr, std::string* outStatus = nullptr) {
+    dumpBytesWritten.store(0, std::memory_order_relaxed);
+    dumpBytesTotal.store(0, std::memory_order_relaxed);
+
+    int driveIndex = ResolvePhysicalDriveIndex(serialNumber);
+    auto partitions = EnumerateUSBPartitions(serialNumber);
+
+    const USBPartitionInfo* targetPart = nullptr;
+    for (const auto& p : partitions) {
+        if (p.partitionNumber == targetPartitionNumber) {
+            targetPart = &p;
+            break;
+        }
+    }
+
+    if (!targetPart) {
+        if (outStatus) *outStatus = "Partition #" + std::to_string(targetPartitionNumber) + " not found.";
+        return false;
+    }
+
+    DWORD err = 0;
+    HANDLE hDevice = OpenPhysicalDriveForRead(driveIndex, FILE_FLAG_SEQUENTIAL_SCAN, err);
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        if (outStatus) *outStatus = "Failed to open physical drive (Error: " + std::to_string(err) + ").";
+        return false;
+    }
+
+    LARGE_INTEGER startPos;
+    startPos.QuadPart = static_cast<LONGLONG>(targetPart->startingOffset);
+    if (!SetFilePointerEx(hDevice, startPos, NULL, FILE_BEGIN)) {
+        CloseHandle(hDevice);
+        if (outStatus) *outStatus = "Failed to seek to partition offset.";
+        return false;
+    }
+
+    std::string fileName = "part" + std::to_string(targetPartitionNumber) + "_pd" + std::to_string(driveIndex) + "_" + SanitizeFileTag(serialNumber) + ".img";
+    std::ofstream outFile(fileName, std::ios::binary);
+    if (!outFile.is_open()) {
+        CloseHandle(hDevice);
+        if (outStatus) *outStatus = "Failed to create output image file: " + fileName;
+        return false;
+    }
+
+    dumpBytesTotal.store(targetPart->partitionLength, std::memory_order_relaxed);
+    dumpBytesWritten.store(0, std::memory_order_relaxed);
+
+    constexpr size_t kChunkSize = 4 * 1024 * 1024;
+    std::vector<BYTE> buffer(kChunkSize);
+    ULONGLONG remaining = targetPart->partitionLength;
+    ULONGLONG writtenTotal = 0;
+
+    while (remaining > 0) {
+        DWORD toRead = static_cast<DWORD>(std::min<ULONGLONG>(remaining, kChunkSize));
+        DWORD bytesRead = 0;
+        if (!ReadFile(hDevice, buffer.data(), toRead, &bytesRead, NULL) || bytesRead == 0) {
+            outFile.close();
+            CloseHandle(hDevice);
+            if (outStatus) *outStatus = "Read error while dumping partition after " + std::to_string(writtenTotal) + " bytes.";
+            return false;
+        }
+
+        outFile.write(reinterpret_cast<const char*>(buffer.data()), bytesRead);
+        if (!outFile.good()) {
+            outFile.close();
+            CloseHandle(hDevice);
+            if (outStatus) *outStatus = "Disk write error while saving partition image.";
+            return false;
+        }
+
+        remaining -= bytesRead;
+        writtenTotal += bytesRead;
+        dumpBytesWritten.store(writtenTotal, std::memory_order_relaxed);
+    }
+
+    outFile.close();
+    CloseHandle(hDevice);
+
+    if (outFilePath) *outFilePath = fileName;
+    if (outStatus) *outStatus = "Partition #" + std::to_string(targetPartitionNumber) + " dumped to " + fileName;
+    return true;
+}
+
+static SectorAnalysisResult ExecuteSectorScan(
+    HANDLE hDevice,
+    unsigned long long totalSectors,
+    double capacityGB,
+    DWORD sectorSize,
+    std::string* liveStatusMsg = nullptr)
+{
+    totalSectorsCount = totalSectors;
+    scannedSectorsCount = 0;
+    currentBadSectors = 0;
+
+    if (totalSectors == 0 || sectorSize == 0) {
+        return { false, 0, 0, 0.0, 0, "Invalid drive geometry (0 sectors)." };
+    }
+
+    const unsigned long long sectorsPerChunk = std::max<unsigned long long>(1ULL, (1024ULL * 1024ULL) / sectorSize);
+    const size_t chunkBytes = static_cast<size_t>(sectorsPerChunk * sectorSize);
+
+    BYTE* chunkBuf = static_cast<BYTE*>(VirtualAlloc(NULL, chunkBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!chunkBuf) {
+        return { false, 0, totalSectors, capacityGB, sectorSize, "Out of memory allocating scan buffer." };
+    }
+
+    int badSectors = 0;
+    unsigned long long sectorIdx = 0;
+
+    while (sectorIdx < totalSectors) {
+        unsigned long long batchSectors = std::min<unsigned long long>(sectorsPerChunk, totalSectors - sectorIdx);
+        DWORD batchBytes = static_cast<DWORD>(batchSectors * sectorSize);
+
+        LARGE_INTEGER liOffset;
+        liOffset.QuadPart = static_cast<LONGLONG>(sectorIdx) * sectorSize;
+
+        DWORD bytesRead = 0;
+        BOOL chunkOk = SetFilePointerEx(hDevice, liOffset, NULL, FILE_BEGIN) &&
+                       ReadFile(hDevice, chunkBuf, batchBytes, &bytesRead, NULL) &&
+                       (bytesRead == batchBytes);
+
+        if (chunkOk) {
+            sectorIdx += batchSectors;
+            scannedSectorsCount = sectorIdx;
+        } else {
+            for (unsigned long long s = 0; s < batchSectors; ++s) {
+                unsigned long long curSector = sectorIdx + s;
+                LARGE_INTEGER singleOffset;
+                singleOffset.QuadPart = static_cast<LONGLONG>(curSector) * sectorSize;
+                DWORD singleRead = 0;
+
+                if (!SetFilePointerEx(hDevice, singleOffset, NULL, FILE_BEGIN) ||
+                    !ReadFile(hDevice, chunkBuf, sectorSize, &singleRead, NULL) ||
+                    singleRead != sectorSize)
+                {
+                    badSectors++;
+                    currentBadSectors = badSectors;
+                }
+                scannedSectorsCount = curSector + 1;
+            }
+            sectorIdx += batchSectors;
+        }
+
+        if (liveStatusMsg && ((sectorIdx % (sectorsPerChunk * 16)) == 0 || sectorIdx == totalSectors)) {
+            double pct = (double)scannedSectorsCount * 100.0 / (double)totalSectors;
+            char buf[128];
+            sprintf_s(buf, sizeof(buf), "Scanning sectors... %.1f%% (%d bad)", pct, badSectors);
+            *liveStatusMsg = buf;
+        }
+    }
+
+    VirtualFree(chunkBuf, 0, MEM_RELEASE);
+
+    std::string msg = "Full scan completed. Total sectors scanned: " + std::to_string(scannedSectorsCount) +
+                      " of " + std::to_string(totalSectors) + ". Errors detected: " + std::to_string(badSectors);
+    return { true, badSectors, totalSectors, capacityGB, sectorSize, msg };
+}
+
+SectorAnalysisResult RunUSBPhysicalAnalysis(const std::string& serialNumber) {
+    int driveIndex = ResolvePhysicalDriveIndex(serialNumber);
+    DWORD err = 0;
+    HANDLE hDevice = OpenPhysicalDriveForRead(driveIndex, FILE_FLAG_NO_BUFFERING, err);
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        return { false, 0, 0, 0.0, 0, "Failed to open physical drive. Run as Administrator? (Code: " + std::to_string(err) + ")" };
+    }
+
+    DISK_GEOMETRY_EX geom = {};
+    DWORD bytesReturned = 0;
+    if (!DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &geom, sizeof(geom), &bytesReturned, NULL) ||
+        geom.Geometry.BytesPerSector == 0)
+    {
+        CloseHandle(hDevice);
+        return { false, 0, 0, 0.0, 0, "Failed to retrieve drive geometry via IOCTL." };
+    }
+
+    DWORD sectorSize = geom.Geometry.BytesPerSector;
+    unsigned long long totalSectors = geom.DiskSize.QuadPart / sectorSize;
+    double capacityGB = static_cast<double>(geom.DiskSize.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+
+    SectorAnalysisResult res = ExecuteSectorScan(hDevice, totalSectors, capacityGB, sectorSize, nullptr);
+    CloseHandle(hDevice);
+    return res;
+}
+
+void RunUSBPhysicalAnalysisWorker(std::string serialNumber) {
+    isScanning = true;
+    scannedSectorsCount = 0;
+    currentBadSectors = 0;
+    scanStatusMessage = "Opening physical device...";
+
+    int driveIndex = ResolvePhysicalDriveIndex(serialNumber);
+    DWORD err = 0;
+    HANDLE hDevice = OpenPhysicalDriveForRead(driveIndex, FILE_FLAG_NO_BUFFERING, err);
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        scanStatusMessage = "Failed to open physical drive. Error code: " + std::to_string(err);
+        isScanning = false;
+        return;
+    }
+
+    DISK_GEOMETRY_EX geom = {};
+    DWORD bytesReturned = 0;
+    if (!DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &geom, sizeof(geom), &bytesReturned, NULL) ||
+        geom.Geometry.BytesPerSector == 0)
+    {
+        CloseHandle(hDevice);
+        scanStatusMessage = "Failed to retrieve drive geometry via IOCTL.";
+        isScanning = false;
+        return;
+    }
+
+    DWORD sectorSize = geom.Geometry.BytesPerSector;
+    unsigned long long totalSectors = geom.DiskSize.QuadPart / sectorSize;
+    double capacityGB = static_cast<double>(geom.DiskSize.QuadPart) / (1024.0 * 1024.0 * 1024.0);
+
+    scanStatusMessage = "Scanning sectors...";
+    SectorAnalysisResult finalRes = ExecuteSectorScan(hDevice, totalSectors, capacityGB, sectorSize, &scanStatusMessage);
+    CloseHandle(hDevice);
+
+    scanStatusMessage = finalRes.success ? "Scan completed successfully." : finalRes.message;
+    isScanning = false;
+
+    ExportUSBReportToHTML(serialNumber, finalRes, false);
+}
+
+void StartAsyncUSBAnalysis(const std::string& serialNumber) {
+    if (isScanning) return;
+    std::thread worker(RunUSBPhysicalAnalysisWorker, serialNumber);
+    worker.detach();
 }
 
 std::vector<MemoryRegion> GetProcessMemoryMap(DWORD pid, std::string& outError) {
@@ -6707,14 +8230,62 @@ std::vector<ModuleInfoItem> GetProcessModules(DWORD pid, std::string& outError) 
 std::vector<ThreadInfoItem> GetProcessThreads(DWORD pid, std::string& outError) {
     std::vector<ThreadInfoItem> threads;
     outError.clear();
+
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) { outError = "Failed to enumerate threads."; return threads; }
-    THREADENTRY32 te; te.dwSize = sizeof(THREADENTRY32);
+    if (hSnap == INVALID_HANDLE_VALUE) { 
+        outError = "Failed to enumerate threads."; 
+        return threads; 
+    }
+
+    typedef NTSTATUS(WINAPI* pfnNtQueryInformationThread)(
+        HANDLE ThreadHandle,
+        ULONG ThreadInformationClass,
+        PVOID ThreadInformation,
+        ULONG ThreadInformationLength,
+        PULONG ReturnLength
+    );
+
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    pfnNtQueryInformationThread NtQueryInformationThread = 
+        (pfnNtQueryInformationThread)GetProcAddress(hNtdll, "NtQueryInformationThread");
+
+    THREADENTRY32 te; 
+    te.dwSize = sizeof(THREADENTRY32);
+    
     if (Thread32First(hSnap, &te)) {
         do {
-            if (te.th32OwnerProcessID == pid) threads.push_back({te.th32ThreadID, te.th32OwnerProcessID, te.tpBasePri});
+            if (te.th32OwnerProcessID == pid) {
+                ThreadInfoItem item;
+                item.tid = te.th32ThreadID;
+                item.ownerPid = te.th32OwnerProcessID;
+                item.basePri = te.tpBasePri;
+                item.startAddress = 0;
+                item.isSuspicious = false;
+
+                if (NtQueryInformationThread) {
+                    HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                    if (hThread) {
+                        PVOID startAddr = NULL;
+                        ULONG returnLength = 0;
+                        NTSTATUS status = NtQueryInformationThread(
+                            hThread, 
+                            9, 
+                            &startAddr, 
+                            sizeof(startAddr), 
+                            &returnLength
+                        );
+                        if (NT_SUCCESS(status)) {
+                            item.startAddress = (uint64_t)startAddr;
+                        }
+                        CloseHandle(hThread);
+                    }
+                }
+
+                threads.push_back(item);
+            }
         } while (Thread32Next(hSnap, &te));
     }
+
     CloseHandle(hSnap);
     return threads;
 }
@@ -7583,8 +9154,8 @@ void ExportSmartTriageHtmlReport(const std::vector<SecurityFinding>& findings) {
 
             htmlFile << "<li class=\"mitre-sidebar-item\">\n";
             htmlFile << "<a class=\"mitre\" href=\"https://attack.mitre.org/techniques/T1055/\" target=\"_blank\">T1055</a>\n";
-            htmlFile << "<div class=\"mitre-title\">Process Injection</div>\n";
-            htmlFile << "<div class=\"mitre-text\">Locates executable memory regions containing write permissions (RWX) outside standard safe program paths.</div>\n";
+            htmlFile << "<div class=\"mitre-title\">Process Injection & Unbacked Threads</div>\n";
+            htmlFile << "<div class=\"mitre-text\">Locates executable memory regions with RWX permissions or unbacked thread start addresses pointing outside valid mapped modules.</div>\n";
             htmlFile << "</li>\n";
 
             htmlFile << "<li class=\"mitre-sidebar-item\">\n";
@@ -7623,6 +9194,130 @@ void ExportSmartTriageHtmlReport(const std::vector<SecurityFinding>& findings) {
             htmlFile.close();
         }
     }
+}
+
+void FlattenProcessTree(const std::vector<ProcessInfo>& processes, std::vector<ProcessInfo>& flatList) {
+    for (const auto& p : processes) {
+        flatList.push_back(p);
+        if (!p.children.empty()) {
+            FlattenProcessTree(p.children, flatList);
+        }
+    }
+}
+
+bool ExportForensicHtmlReport(const std::vector<ProcessInfo>& rootProcesses) {
+    time_t now = time(0);
+    tm ltm;
+    localtime_s(&ltm, &now);
+    char szFile[MAX_PATH] = { 0 };
+    sprintf_s(szFile, sizeof(szFile), "Forensic_Process_Report_%04d-%02d-%02d_%02d-%02d-%02d.html",
+              1900 + ltm.tm_year, 1 + ltm.tm_mon, ltm.tm_mday,
+              ltm.tm_hour, ltm.tm_min, ltm.tm_sec);
+
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = "HTML Files (*.html)\0*.html\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = "Save Forensic HTML Report";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "html";
+
+    if (!GetSaveFileNameA(&ofn)) {
+        return false;
+    }
+
+    std::ofstream htmlFile(szFile);
+    if (!htmlFile.is_open()) return false;
+
+    std::vector<ProcessInfo> allProcesses;
+    FlattenProcessTree(rootProcesses, allProcesses);
+
+    htmlFile << "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n";
+    htmlFile << "<meta charset=\"UTF-8\">\n";
+    htmlFile << "<title>Forensic Task Manager - Process Report</title>\n";
+    htmlFile << "<style>\n";
+    htmlFile << "  body { background-color: #0d1117; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 24px; }\n";
+    htmlFile << "  h1 { color: #58a6ff; font-size: 24px; border-bottom: 1px solid #30363d; padding-bottom: 12px; margin-top: 0; }\n";
+    htmlFile << "  .meta { color: #8b949e; font-size: 13px; margin-bottom: 20px; }\n";
+    htmlFile << "  table { width: 100%; border-collapse: collapse; margin-top: 10px; background-color: #161b22; border-radius: 8px; overflow: hidden; border: 1px solid #30363d; }\n";
+    htmlFile << "  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }\n";
+    htmlFile << "  th { background-color: #161b22; color: #f0f6fc; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; border-bottom: 2px solid #30363d; }\n";
+    htmlFile << "  tr:hover { background-color: #1f6feb15; }\n";
+    htmlFile << "  .badge { padding: 3px 8px; border-radius: 12px; font-weight: 600; font-size: 11px; display: inline-block; }\n";
+    htmlFile << "  .badge-red { background-color: #da363325; color: #f85149; border: 1px solid #f8514940; }\n";
+    htmlFile << "  .badge-yellow { background-color: #9e6a0325; color: #d29922; border: 1px solid #d2992240; }\n";
+    htmlFile << "  .badge-green { background-color: #23863625; color: #3fb950; border: 1px solid #3fb95040; }\n";
+    htmlFile << "  .path { color: #8b949e; font-family: monospace; font-size: 12px; word-break: break-all; }\n";
+    htmlFile << "</style>\n</head>\n<body>\n";
+
+    htmlFile << "<h1>Forensic Task Manager &mdash; Process Audit Report</h1>\n";
+    htmlFile << "<div class=\"meta\">Generated on: " 
+             << 1900 + ltm.tm_year << "-" << (1 + ltm.tm_mon < 10 ? "0" : "") << 1 + ltm.tm_mon << "-" 
+             << (ltm.tm_mday < 10 ? "0" : "") << ltm.tm_mday << " " 
+             << (ltm.tm_hour < 10 ? "0" : "") << ltm.tm_hour << ":" 
+             << (ltm.tm_min < 10 ? "0" : "") << ltm.tm_min << ":" 
+             << (ltm.tm_sec < 10 ? "0" : "") << ltm.tm_sec 
+             << " | Total Audited Processes: " << allProcesses.size() << "</div>\n";
+
+    htmlFile << "<table>\n<thead>\n<tr>";
+    htmlFile << "<th>Name</th><th>PID</th><th>PPID</th><th>Risk</th><th>CPU</th><th>Memory</th><th>Priority</th><th>Status / Spoofing</th><th>Signature</th><th>Privileges</th><th>Path</th>";
+    htmlFile << "</tr>\n</thead>\n<tbody>\n";
+
+    for (const auto& p : allProcesses) {
+        htmlFile << "<tr>\n";
+        htmlFile << "<td>";
+        if (p.isHidden) {
+            htmlFile << "<span class=\"badge badge-red\">[HIDDEN]</span> ";
+        }
+        htmlFile << "<strong>" << p.name << "</strong></td>\n";
+        htmlFile << "<td>" << p.pid << "</td>\n";
+        htmlFile << "<td>" << p.parentPid << "</td>\n";
+
+        int risk = 0;
+        if (p.isHidden) risk += 100;
+        if (p.isParentSpoofed) risk += 45;
+        if (!p.isSigned && p.exePath != "N/A") risk += 20;
+
+        if (risk >= 50) {
+            htmlFile << "<td><span class=\"badge badge-red\">" << risk << " (HIGH)</span></td>\n";
+        } else if (risk > 0) {
+            htmlFile << "<td><span class=\"badge badge-yellow\">" << risk << " (MED)</span></td>\n";
+        } else {
+            htmlFile << "<td><span class=\"badge badge-green\">0 (LOW)</span></td>\n";
+        }
+
+        htmlFile << "<td>" << p.cpuUsage << "%</td>\n";
+        htmlFile << "<td>" << (p.workingSetSize / (1024 * 1024)) << " MB</td>\n";
+        htmlFile << "<td>" << p.priorityStr << "</td>\n";
+
+        if (p.isParentSpoofed || p.isHidden) {
+            htmlFile << "<td><span style=\"color:#f85149;\">" << (p.spoofingReason.empty() ? "Anomalous" : p.spoofingReason) << "</span></td>\n";
+        } else {
+            htmlFile << "<td><span style=\"color:#3fb950;\">OK</span></td>\n";
+        }
+
+        htmlFile << "<td>" << (p.isSigned ? "<span style=\"color:#3fb950;\">Signed</span>" : "<span style=\"color:#8b949e;\">Unsigned</span>") << "</td>\n";
+
+        htmlFile << "<td>";
+        if (p.privileges.empty()) {
+            htmlFile << "<span style=\"color:#8b949e;\">None</span>";
+        } else {
+            for (size_t i = 0; i < p.privileges.size(); ++i) {
+                htmlFile << "<span style=\"color:#d29922;\">" << p.privileges[i] << "</span>" << (i + 1 < p.privileges.size() ? ", " : "");
+            }
+        }
+        htmlFile << "</td>\n";
+
+        htmlFile << "<td class=\"path\">" << p.exePath << "</td>\n";
+        htmlFile << "</tr>\n";
+    }
+
+    htmlFile << "</tbody>\n</table>\n</body>\n</html>";
+    htmlFile.close();
+    return true;
 }
 
 void ApplyGlassmorphismTheme(float alpha, ImVec4 accentColor, ImVec4 bgColor) {
@@ -7814,6 +9509,402 @@ float GetProcessCpuUsage() {
     if (cpuUsage > 100.0) cpuUsage = 100.0;
 
     return (float)cpuUsage;
+}
+
+static std::string Utf16LeToAscii(const uint8_t* data, size_t byteLen) {
+    std::string out;
+    for (size_t i = 0; i + 1 < byteLen; i += 2) {
+        uint16_t wc = ReadU16LE(data + i);
+        if (wc == 0x0000 || wc == 0xFFFF) break;
+        if (wc < 0x80) {
+            out.push_back(static_cast<char>(wc));
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+static bool ReadAtOffset(std::ifstream& f, uint64_t offset, void* dst, size_t size) {
+    f.clear();
+    f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!f.good()) return false;
+    f.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(size));
+    return f.gcount() == static_cast<std::streamsize>(size);
+}
+
+static bool BytesEqualAt(const uint8_t* buf, size_t bufLen, size_t offset, const char* literal8) {
+    if (offset + 8 > bufLen || !literal8) return false;
+    return std::equal(literal8, literal8 + 8, reinterpret_cast<const char*>(buf + offset));
+}
+
+bool OpenImageFilesystem(const std::string& imagePath, ImageFsContext& ctx, uint64_t partitionOffset = 0) {
+    ctx = ImageFsContext{};
+    ctx.imagePath = imagePath;
+    ctx.partitionOffset = partitionOffset;
+
+    std::ifstream f(imagePath, std::ios::binary);
+    if (!f.is_open()) return false;
+
+    uint8_t bootSec[512] = {};
+    if (!ReadAtOffset(f, partitionOffset, bootSec, sizeof(bootSec))) return false;
+
+    if (BytesEqualAt(bootSec, sizeof(bootSec), 3, "EXFAT   ")) {
+        uint8_t secShift = bootSec[108];
+        uint8_t spcShift = bootSec[109];
+        if (secShift < 9 || secShift > 12 || spcShift > 20) return false;
+
+        ctx.fsType = ImageFsContext::FsType::ExFat;
+        ctx.bytesPerSector = 1u << secShift;
+        ctx.sectorsPerCluster = 1u << spcShift;
+        ctx.bytesPerCluster = ctx.bytesPerSector * ctx.sectorsPerCluster;
+
+        uint32_t fatOffsetSec = ReadU32LE(bootSec + 80);
+        uint32_t heapOffsetSec = ReadU32LE(bootSec + 88);
+        ctx.exfatRootCluster = ReadU32LE(bootSec + 96);
+
+        ctx.fatOffsetBytes = partitionOffset + static_cast<uint64_t>(fatOffsetSec) * ctx.bytesPerSector;
+        ctx.exfatHeapOffsetBytes = partitionOffset + static_cast<uint64_t>(heapOffsetSec) * ctx.bytesPerSector;
+        return ctx.exfatRootCluster >= 2;
+    }
+
+    uint16_t bytsPerSec = ReadU16LE(bootSec + 11);
+    uint8_t secPerClus = bootSec[13];
+    uint16_t rsvdSecCnt = ReadU16LE(bootSec + 14);
+    uint8_t numFATs = bootSec[16];
+    uint16_t rootEntCnt = ReadU16LE(bootSec + 17);
+    uint16_t totSec16 = ReadU16LE(bootSec + 19);
+    uint16_t fatSz16 = ReadU16LE(bootSec + 22);
+    uint32_t totSec32 = ReadU32LE(bootSec + 32);
+    uint32_t fatSz32 = ReadU32LE(bootSec + 36);
+
+    if (bytsPerSec == 0 || secPerClus == 0 || numFATs == 0) return false;
+
+    uint32_t totalSectors = (totSec16 != 0) ? totSec16 : totSec32;
+    uint32_t fatSize = (fatSz16 != 0) ? fatSz16 : fatSz32;
+    if (totalSectors == 0 || fatSize == 0) return false;
+
+    ctx.bytesPerSector = bytsPerSec;
+    ctx.sectorsPerCluster = secPerClus;
+    ctx.bytesPerCluster = static_cast<uint32_t>(bytsPerSec) * secPerClus;
+    ctx.rootDirSectors = ((rootEntCnt * 32u) + (bytsPerSec - 1u)) / bytsPerSec;
+
+    uint32_t firstDataSector = rsvdSecCnt + (numFATs * fatSize) + ctx.rootDirSectors;
+    if (totalSectors <= firstDataSector) return false;
+
+    uint32_t dataSectors = totalSectors - firstDataSector;
+    uint32_t clusterCount = dataSectors / secPerClus;
+
+    ctx.fatOffsetBytes = partitionOffset + static_cast<uint64_t>(rsvdSecCnt) * bytsPerSec;
+
+    if (fatSz16 == 0 && fatSz32 != 0 && clusterCount >= 4085) {
+        ctx.fsType = ImageFsContext::FsType::Fat32;
+        ctx.rootCluster = ReadU32LE(bootSec + 44);
+        ctx.dataRegionOffsetBytes = partitionOffset + static_cast<uint64_t>(rsvdSecCnt + numFATs * fatSz32) * bytsPerSec;
+        return ctx.rootCluster >= 2;
+    } else if (clusterCount >= 4085 && clusterCount < 65525) {
+        ctx.fsType = ImageFsContext::FsType::Fat16;
+        ctx.rootDirOffsetBytes = partitionOffset + static_cast<uint64_t>(rsvdSecCnt + numFATs * fatSz16) * bytsPerSec;
+        ctx.dataRegionOffsetBytes = ctx.rootDirOffsetBytes + static_cast<uint64_t>(ctx.rootDirSectors) * bytsPerSec;
+        return true;
+    }
+
+    return false;
+}
+
+static uint64_t ClusterToOffset(const ImageFsContext& ctx, uint32_t cluster) {
+    if (ctx.fsType == ImageFsContext::FsType::ExFat) {
+        return ctx.exfatHeapOffsetBytes + static_cast<uint64_t>(cluster - 2) * ctx.bytesPerCluster;
+    }
+    return ctx.dataRegionOffsetBytes + static_cast<uint64_t>(cluster - 2) * ctx.bytesPerCluster;
+}
+
+static uint32_t ReadNextCluster(std::ifstream& f, const ImageFsContext& ctx, uint32_t cluster, bool& isEnd) {
+    isEnd = false;
+    if (ctx.fsType == ImageFsContext::FsType::Fat32) {
+        uint64_t entryOff = ctx.fatOffsetBytes + static_cast<uint64_t>(cluster) * 4ULL;
+        uint8_t buf[4] = {};
+        if (!ReadAtOffset(f, entryOff, buf, 4)) { isEnd = true; return 0; }
+        uint32_t val = ReadU32LE(buf) & 0x0FFFFFFFu;
+        if (val >= 0x0FFFFFF8u || val < 2u) { isEnd = true; return 0; }
+        return val;
+    }
+    if (ctx.fsType == ImageFsContext::FsType::Fat16) {
+        uint64_t entryOff = ctx.fatOffsetBytes + static_cast<uint64_t>(cluster) * 2ULL;
+        uint8_t buf[2] = {};
+        if (!ReadAtOffset(f, entryOff, buf, 2)) { isEnd = true; return 0; }
+        uint16_t val = ReadU16LE(buf);
+        if (val >= 0xFFF8u || val < 2u) { isEnd = true; return 0; }
+        return val;
+    }
+    if (ctx.fsType == ImageFsContext::FsType::ExFat) {
+        uint64_t entryOff = ctx.fatOffsetBytes + static_cast<uint64_t>(cluster) * 4ULL;
+        uint8_t buf[4] = {};
+        if (!ReadAtOffset(f, entryOff, buf, 4)) { isEnd = true; return 0; }
+        uint32_t val = ReadU32LE(buf);
+        if (val >= 0xFFFFFFF8u || val < 2u) { isEnd = true; return 0; }
+        return val;
+    }
+    isEnd = true;
+    return 0;
+}
+
+static std::string FormatShort83Name(const uint8_t* raw11) {
+    std::string base, ext;
+    for (int i = 0; i < 8; ++i) {
+        char c = static_cast<char>(raw11[i]);
+        if (c != ' ') base.push_back(c);
+    }
+    for (int i = 8; i < 11; ++i) {
+        char c = static_cast<char>(raw11[i]);
+        if (c != ' ') ext.push_back(c);
+    }
+    if (base.empty() || static_cast<uint8_t>(base[0]) == 0x05) {
+        if (!base.empty()) base[0] = static_cast<char>(0xE5);
+    }
+    return ext.empty() ? base : (base + "." + ext);
+}
+
+static void ParseFatDirectoryBuffer(const std::vector<uint8_t>& dirData, const std::string& parentPath, std::vector<ImageFsEntry>& outEntries) {
+    std::string lfnAccum;
+    bool hasLfn = false;
+
+    for (size_t off = 0; off + 32 <= dirData.size(); off += 32) {
+        const uint8_t* e = dirData.data() + off;
+        uint8_t firstByte = e[0];
+
+        if (firstByte == 0x00) break;
+        if (firstByte == 0xE5) {
+            lfnAccum.clear();
+            hasLfn = false;
+            continue;
+        }
+
+        uint8_t attr = e[11];
+        if ((attr & 0x0F) == 0x0F) {
+            std::string part;
+            int offsets[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+            for (int k = 0; k < 13; ++k) {
+                uint16_t wc = ReadU16LE(e + offsets[k]);
+                if (wc == 0x0000 || wc == 0xFFFF) break;
+                part.push_back(wc < 0x80 ? static_cast<char>(wc) : '_');
+            }
+            lfnAccum = part + lfnAccum;
+            hasLfn = true;
+            continue;
+        }
+
+        std::string name = (hasLfn && !lfnAccum.empty()) ? lfnAccum : FormatShort83Name(e);
+        lfnAccum.clear();
+        hasLfn = false;
+
+        if (attr & 0x08) continue;
+        if (name == "." || name == "..") continue;
+
+        bool isDir = (attr & 0x10) != 0;
+        uint32_t hiClus = ReadU16LE(e + 20);
+        uint32_t loClus = ReadU16LE(e + 26);
+        uint32_t startCluster = (hiClus << 16) | loClus;
+        uint32_t fileSize = isDir ? 0 : ReadU32LE(e + 28);
+
+        ImageFsEntry item;
+        item.name = name;
+        item.fullPath = (parentPath.empty() || parentPath == "/") ? ("/" + name) : (parentPath + "/" + name);
+        item.isDirectory = isDir;
+        item.sizeBytes = fileSize;
+        item.firstCluster = startCluster;
+        outEntries.push_back(item);
+    }
+}
+
+static void ParseExFatDirectoryBuffer(const std::vector<uint8_t>& dirData, const std::string& parentPath, std::vector<ImageFsEntry>& outEntries) {
+    bool inSet = false;
+    bool isDir = false;
+    uint32_t firstCluster = 0;
+    uint64_t dataLength = 0;
+    bool noFatChain = false;
+    std::string nameAccum;
+
+    for (size_t off = 0; off + 32 <= dirData.size(); off += 32) {
+        const uint8_t* e = dirData.data() + off;
+        uint8_t type = e[0];
+
+        if (type == 0x00) break;
+        if ((type & 0x80) == 0) continue;
+
+        if (type == 0x85) {
+            inSet = true;
+            uint16_t fileAttr = ReadU16LE(e + 4);
+            isDir = (fileAttr & 0x0010u) != 0;
+            firstCluster = 0;
+            dataLength = 0;
+            noFatChain = false;
+            nameAccum.clear();
+        } else if (type == 0xC0 && inSet) {
+            uint8_t flags = e[1];
+            noFatChain = (flags & 0x02u) != 0;
+            firstCluster = ReadU32LE(e + 20);
+            dataLength = ReadU64LE(e + 24);
+        } else if (type == 0xC1 && inSet) {
+            nameAccum += Utf16LeToAscii(e + 2, 30);
+        } else if (type == 0x81 || type == 0x82) {
+            inSet = false;
+        }
+
+        if (inSet && off + 64 <= dirData.size()) {
+            uint8_t nextType = dirData[off + 32];
+            if (nextType != 0xC0 && nextType != 0xC1) {
+                if (!nameAccum.empty() && nameAccum != "." && nameAccum != "..") {
+                    ImageFsEntry item;
+                    item.name = nameAccum;
+                    item.fullPath = (parentPath.empty() || parentPath == "/") ? ("/" + nameAccum) : (parentPath + "/" + nameAccum);
+                    item.isDirectory = isDir;
+                    item.sizeBytes = isDir ? 0 : dataLength;
+                    item.firstCluster = firstCluster;
+                    item.noFatChain = noFatChain;
+                    outEntries.push_back(item);
+                }
+                inSet = false;
+            }
+        }
+    }
+}
+
+std::vector<ImageFsEntry> ListImageDirectory(const ImageFsContext& ctx, uint32_t dirCluster, const std::string& currentPath, bool isFat16Root = false) {
+    std::vector<ImageFsEntry> entries;
+    std::ifstream f(ctx.imagePath, std::ios::binary);
+    if (!f.is_open()) return entries;
+
+    std::vector<uint8_t> dirBuf;
+
+    if (ctx.fsType == ImageFsContext::FsType::Fat16 && isFat16Root) {
+        size_t rootBytes = static_cast<size_t>(ctx.rootDirSectors) * ctx.bytesPerSector;
+        dirBuf.resize(rootBytes);
+        if (!ReadAtOffset(f, ctx.rootDirOffsetBytes, dirBuf.data(), rootBytes)) return entries;
+        ParseFatDirectoryBuffer(dirBuf, currentPath, entries);
+        return entries;
+    }
+
+    uint32_t cur = dirCluster;
+    size_t safety = 0;
+    while (cur >= 2 && safety++ < 100000) {
+        size_t prevSize = dirBuf.size();
+        dirBuf.resize(prevSize + ctx.bytesPerCluster);
+        if (!ReadAtOffset(f, ClusterToOffset(ctx, cur), dirBuf.data() + prevSize, ctx.bytesPerCluster)) {
+            break;
+        }
+        bool isEnd = false;
+        cur = ReadNextCluster(f, ctx, cur, isEnd);
+        if (isEnd) break;
+    }
+
+    if (ctx.fsType == ImageFsContext::FsType::ExFat) {
+        ParseExFatDirectoryBuffer(dirBuf, currentPath, entries);
+    } else {
+        ParseFatDirectoryBuffer(dirBuf, currentPath, entries);
+    }
+    return entries;
+}
+
+bool ExtractFileFromImage(const ImageFsContext& ctx, const ImageFsEntry& fileEntry, const std::string& outputFilePath, std::string& outStatus) {
+    if (fileEntry.isDirectory) {
+        outStatus = "Selected entry is a directory, not a file.";
+        return false;
+    }
+
+    std::ifstream f(ctx.imagePath, std::ios::binary);
+    if (!f.is_open()) {
+        outStatus = "Failed to open source image: " + ctx.imagePath;
+        return false;
+    }
+
+    std::ofstream out(outputFilePath, std::ios::binary);
+    if (!out.is_open()) {
+        outStatus = "Failed to create output file: " + outputFilePath;
+        return false;
+    }
+
+    if (fileEntry.sizeBytes == 0) {
+        outStatus = "Extracted empty file to " + outputFilePath;
+        return true;
+    }
+
+    uint64_t remaining = fileEntry.sizeBytes;
+    std::vector<uint8_t> clusterBuf(ctx.bytesPerCluster);
+    uint32_t curCluster = fileEntry.firstCluster;
+    size_t safety = 0;
+
+    while (remaining > 0 && curCluster >= 2 && safety++ < 10000000) {
+        uint64_t clusOff = ClusterToOffset(ctx, curCluster);
+        if (!ReadAtOffset(f, clusOff, clusterBuf.data(), ctx.bytesPerCluster)) {
+            outStatus = "Read error inside image while extracting " + fileEntry.name;
+            return false;
+        }
+
+        size_t toWrite = static_cast<size_t>(std::min<uint64_t>(remaining, ctx.bytesPerCluster));
+        out.write(reinterpret_cast<const char*>(clusterBuf.data()), static_cast<std::streamsize>(toWrite));
+        if (!out.good()) {
+            outStatus = "Write error saving extracted file: " + outputFilePath;
+            return false;
+        }
+
+        remaining -= toWrite;
+        if (remaining == 0) break;
+
+        if (ctx.fsType == ImageFsContext::FsType::ExFat && fileEntry.noFatChain) {
+            curCluster += 1;
+        } else {
+            bool isEnd = false;
+            curCluster = ReadNextCluster(f, ctx, curCluster, isEnd);
+            if (isEnd) break;
+        }
+    }
+
+    outStatus = "Extracted '" + fileEntry.name + "' (" + std::to_string(fileEntry.sizeBytes) + " bytes) to " + outputFilePath;
+    return true;
+}
+
+static std::string DetectImageSignature(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return "Unreadable";
+
+    unsigned char hdr[512] = {};
+    f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+    std::streamsize n = f.gcount();
+    if (n < 16) return "Small / Raw";
+
+    if (n >= 512 && hdr[510] == 0x55 && hdr[511] == 0xAA) {
+        if (BytesEqualAt(hdr, static_cast<size_t>(n), 3,  "NTFS    ")) return "NTFS Volume / Boot";
+        if (BytesEqualAt(hdr, static_cast<size_t>(n), 82, "FAT32   ")) return "FAT32 Volume / Boot";
+        if (BytesEqualAt(hdr, static_cast<size_t>(n), 3,  "EXFAT   ")) return "exFAT Volume / Boot";
+        return "MBR / Boot Sector (0x55AA)";
+    }
+    if (n >= 11 && BytesEqualAt(hdr, static_cast<size_t>(n), 3,  "EXFAT   ")) return "exFAT Partition";
+    if (n >= 11 && BytesEqualAt(hdr, static_cast<size_t>(n), 3,  "NTFS    ")) return "NTFS Partition";
+    if (n >= 90 && BytesEqualAt(hdr, static_cast<size_t>(n), 82, "FAT32   ")) return "FAT32 Partition";
+    return "Raw Partition / Binary";
+}
+
+static std::vector<DumpedImageEntry> ScanDumpedImages(const std::string& dirPath = ".") {
+    std::vector<DumpedImageEntry> list;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dirPath, ec)) {
+        if (!entry.is_regular_file(ec)) continue;
+        std::string ext = entry.path().extension().string();
+        for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+
+        if (ext == ".img" || ext == ".bin") {
+            DumpedImageEntry item;
+            item.fileName = entry.path().filename().string();
+            item.fullPath = entry.path().string();
+            item.fileSizeBytes = entry.file_size(ec);
+            item.sizeMB = static_cast<double>(item.fileSizeBytes) / (1024.0 * 1024.0);
+            item.detectedType = DetectImageSignature(item.fullPath);
+            item.lastWriteStr = "Local File";
+            list.push_back(item);
+        }
+    }
+    return list;
 }
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -8035,6 +10126,14 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
         ImGui::Begin("NexusDashboard", NULL, window_flags);
         
+        static std::atomic<bool> isCheckingUpdate{ false };
+        static std::atomic<bool> isApplyingUpdate{ false };
+        static bool openUpdateConfirmModal = false;
+        static bool openUpdateStatusModal = false;
+        static std::mutex updateInfoMutex;
+        static UpdateCheckResult latestUpdateResult;
+        static std::string updateUiMessage = "";
+
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("Settings // Theme")) {
                 for (int i = 0; i < (int)themes.size(); ++i) {
@@ -8090,6 +10189,36 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 if (ImGui::MenuItem("Forensic Report Viewer...")) {
                     showReportViewerModal = true;
                 }
+
+                ImGui::Separator();
+
+                bool busyUpdate = isCheckingUpdate.load(std::memory_order_relaxed) || isApplyingUpdate.load(std::memory_order_relaxed);
+                std::string updateMenuLabel = isCheckingUpdate.load(std::memory_order_relaxed)
+                    ? "Checking for Updates..."
+                    : (isApplyingUpdate.load(std::memory_order_relaxed) ? "Updating App..." : "Check for Updates...");
+
+                if (ImGui::MenuItem(updateMenuLabel.c_str(), NULL, false, !busyUpdate)) {
+                    isCheckingUpdate.store(true, std::memory_order_relaxed);
+                    std::string currentVerCopy = version;
+
+                    std::thread([currentVerCopy]() {
+                        UpdateCheckResult res = CheckGitHubUpdate(currentVerCopy);
+                        {
+                            std::lock_guard<std::mutex> lock(updateInfoMutex);
+                            latestUpdateResult = res;
+                            if (!res.success) {
+                                updateUiMessage = res.statusMessage;
+                                openUpdateStatusModal = true;
+                            } else if (res.updateAvailable) {
+                                openUpdateConfirmModal = true;
+                            } else {
+                                updateUiMessage = res.statusMessage;
+                                openUpdateStatusModal = true;
+                            }
+                        }
+                        isCheckingUpdate.store(false, std::memory_order_relaxed);
+                    }).detach();
+                }
                 
                 ImGui::Separator();
 
@@ -8127,6 +10256,85 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndMenu();
             }
 
+            bool triggerConfirmModal = false;
+            bool triggerStatusModal = false;
+            UpdateCheckResult snapResult;
+            std::string snapStatusMsg;
+            {
+                std::lock_guard<std::mutex> lock(updateInfoMutex);
+                if (openUpdateConfirmModal) {
+                    triggerConfirmModal = true;
+                    openUpdateConfirmModal = false;
+                }
+                if (openUpdateStatusModal) {
+                    triggerStatusModal = true;
+                    openUpdateStatusModal = false;
+                }
+                snapResult = latestUpdateResult;
+                snapStatusMsg = updateUiMessage;
+            }
+
+            if (triggerConfirmModal) {
+                ImGui::OpenPopup("Confirm App Update");
+            }
+            if (triggerStatusModal) {
+                ImGui::OpenPopup("Update Check");
+            }
+
+            if (ImGui::BeginPopupModal("Confirm App Update", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                std::string targetReleaseLabel = !snapResult.latestReleaseName.empty() ? snapResult.latestReleaseName : snapResult.latestTag;
+                ImGui::TextColored(themes[currentThemeIndex].accentColor, "New update available!");
+                ImGui::Spacing();
+                ImGui::Text("Current Version: %s", version.c_str());
+                ImGui::Text("Latest Release:  %s", targetReleaseLabel.c_str());
+                if (!snapResult.latestTag.empty()) {
+                    ImGui::Text("Tag:             %s", snapResult.latestTag.c_str());
+                }
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                    "Do you want to download and install this update now? The app will restart.");
+
+                ImGui::Spacing();
+                bool canConfirm = !isApplyingUpdate.load(std::memory_order_relaxed);
+                if (!canConfirm) ImGui::BeginDisabled();
+
+                if (ImGui::Button("Yes, Update & Restart", ImVec2(175, 0))) {
+                    isApplyingUpdate.store(true, std::memory_order_relaxed);
+                    std::string urlCopy = snapResult.downloadUrl;
+
+                    std::thread([urlCopy]() {
+                        std::string applyMsg;
+                        bool ok = DownloadAndApplyUpdate(urlCopy, applyMsg, true);
+                        if (!ok) {
+                            {
+                                std::lock_guard<std::mutex> lock(updateInfoMutex);
+                                updateUiMessage = applyMsg;
+                                openUpdateStatusModal = true;
+                            }
+                            isApplyingUpdate.store(false, std::memory_order_relaxed);
+                        }
+                    }).detach();
+
+                    ImGui::CloseCurrentPopup();
+                }
+                if (!canConfirm) ImGui::EndDisabled();
+
+                ImGui::SameLine();
+                if (ImGui::Button("Later", ImVec2(100, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
+            if (ImGui::BeginPopupModal("Update Check", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextWrapped("%s", snapStatusMsg.c_str());
+                ImGui::Spacing();
+                if (ImGui::Button("OK", ImVec2(120, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+
             DWORD processId = GetCurrentProcessId();
             char exePath[MAX_PATH] = { 0 };
             GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -8158,7 +10366,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             sprintf_s(cpuBuffer, "CPU: %.1f%%", cachedCpu);
             std::string cpuUsageStr = cpuBuffer;
 
-            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  v1.0.7 Release";
+            std::string statusText = processInfoStr + "   " + cpuUsageStr + "  |  " + ramUsageStr + "  |  " + version ;
             float textWidth = ImGui::CalcTextSize(statusText.c_str()).x;
             float availableWidth = ImGui::GetContentRegionAvail().x;
             if (availableWidth > textWidth) {
@@ -8181,7 +10389,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             "Event Logs", "Artifact Scanner", "Network Connections", "Installed Apps", 
             "Windows Services", "Scheduled Tasks", "DLL Dependency Viewer", 
             "Startup Applications", "Environment Variables", "Locked Handles", 
-            "Dump Analyzer", "Live Tracker", "Tech Toolbox", "Hardware Specs", "Logon Sessions",  "Smart Triaje"
+            "Dump Analyzer", "Live Tracker", "Tech Toolbox", "Hardware Specs", "Logon Sessions",  "Smart Triaje", "img Inspector"
         };
 
         if (!showSidebar) {
@@ -8243,7 +10451,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
             ImGui::Spacing();
 
             ImGui::TextDisabled("SECURITY & KERNEL");
-            int securityTabs[] = { 3, 11, 12, 22 };
+            int securityTabs[] = { 3, 11, 12, 22, 28 };
             for (int idx : securityTabs) {
                 if (ImGui::Selectable(tabNames[idx], currentTab == idx)) {
                     currentTab = idx;
@@ -9437,14 +11645,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     ImGui::BeginChild("TriageGridScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
                     int columns = 3;
-                    ImGuiTableFlags gridFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV;
+                    ImGuiTableFlags gridFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_BordersInnerH;
 
                     if (ImGui::BeginTable("TriageCardsGrid", columns, gridFlags)) {
-                        
+                        for (int c = 0; c < columns; ++c) {
+                            char colId[32];
+                            snprintf(colId, sizeof(colId), "Col_%d", c);
+                            ImGui::TableSetupColumn(colId, ImGuiTableColumnFlags_WidthStretch);
+                        }
+
                         for (auto& pair : findingsByPid) {
                             DWORD pid = pair.first;
                             const auto& pFindings = pair.second;
                             if (pFindings.empty()) continue;
+                            
                             if (strlen(triageSearchFilter) > 0) {
                                 bool matchFound = false;
                                 std::string filterLower = triageSearchFilter;
@@ -9534,51 +11748,571 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::EndTabItem();
             }
 
+            static std::vector<DumpedImageEntry> dumpedImagesList;
+            static bool dumpedImagesLoadedOnce = false;
+            static int selectedDumpedImageIdx = -1;
+
+            static ImageFsContext activeImgFsCtx;
+            static bool activeImgFsOpen = false;
+            static bool activeImgIsFat16Root = false;
+            static uint32_t currentImgDirCluster = 2;
+            static std::string currentImgDirPath = "/";
+
+            struct ImgNavHistoryItem {
+                uint32_t cluster;
+                std::string path;
+                bool isFat16Root;
+            };
+            static std::vector<ImgNavHistoryItem> imgDirHistory;
+
+            static std::vector<ImageFsEntry> currentImgEntries;
+            static int selectedImgEntryIdx = -1;
+            static char imgFileFilter[128] = "";
+            static std::string imgExtractStatus = "Ready";
+
+            auto RefreshImageExplorer = [&]() {
+                dumpedImagesList = ScanDumpedImages(".");
+                dumpedImagesLoadedOnce = true;
+
+                if (selectedDumpedImageIdx >= (int)dumpedImagesList.size()) {
+                    selectedDumpedImageIdx = -1;
+                    activeImgFsOpen = false;
+                    currentImgEntries.clear();
+                    selectedImgEntryIdx = -1;
+                }
+
+                if (selectedDumpedImageIdx >= 0 && selectedDumpedImageIdx < (int)dumpedImagesList.size()) {
+                    const auto& img = dumpedImagesList[selectedDumpedImageIdx];
+                    activeImgFsOpen = OpenImageFilesystem(img.fullPath, activeImgFsCtx, 0);
+                    imgDirHistory.clear();
+                    selectedImgEntryIdx = -1;
+                    currentImgDirPath = "/";
+
+                    if (activeImgFsOpen) {
+                        if (activeImgFsCtx.fsType == ImageFsContext::FsType::ExFat) {
+                            currentImgDirCluster = activeImgFsCtx.exfatRootCluster;
+                            activeImgIsFat16Root = false;
+                        } else if (activeImgFsCtx.fsType == ImageFsContext::FsType::Fat32) {
+                            currentImgDirCluster = activeImgFsCtx.rootCluster;
+                            activeImgIsFat16Root = false;
+                        } else {
+                            currentImgDirCluster = 0;
+                            activeImgIsFat16Root = true;
+                        }
+                        currentImgEntries = ListImageDirectory(activeImgFsCtx, currentImgDirCluster, currentImgDirPath, activeImgIsFat16Root);
+                    } else {
+                        currentImgEntries.clear();
+                    }
+                }
+            };
+
+            if (ImGui::BeginTabItem("Image Explorer", NULL, (currentTab == 28 ? itemFlags : 0))) {
+                ImGui::Spacing();
+
+                if (!dumpedImagesLoadedOnce) {
+                    RefreshImageExplorer();
+                }
+
+                if (ImGui::Button("Refresh Images")) {
+                    RefreshImageExplorer();
+                }
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(240);
+                ImGui::InputText("Filter Files", imgFileFilter, IM_ARRAYSIZE(imgFileFilter));
+
+                ImGui::SameLine();
+                bool hasFileSelected = activeImgFsOpen &&
+                                    selectedImgEntryIdx >= 0 &&
+                                    selectedImgEntryIdx < (int)currentImgEntries.size() &&
+                                    !currentImgEntries[selectedImgEntryIdx].isDirectory;
+
+                if (!hasFileSelected) {
+                    ImGui::BeginDisabled();
+                }
+                if (ImGui::Button("Extract Selected File")) {
+                    const auto& targetFile = currentImgEntries[selectedImgEntryIdx];
+                    std::string outName = "extracted_" + targetFile.name;
+                    std::string statusMsg;
+                    ExtractFileFromImage(activeImgFsCtx, targetFile, outName, statusMsg);
+                    imgExtractStatus = statusMsg;
+                }
+                if (!hasFileSelected) {
+                    ImGui::EndDisabled();
+                }
+
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.3f, 0.85f, 1.0f, 1.0f), "[Image]: %s", imgExtractStatus.c_str());
+                ImGui::Separator();
+
+                ImGuiTableFlags imgListFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                if (ImGui::BeginTable("DumpedImagesTable", 4, imgListFlags, ImVec2(0, 170))) {
+                    ImGui::TableSetupColumn("Image File", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                    ImGui::TableSetupColumn("Type / Signature", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+                    ImGui::TableSetupColumn("Size (MB)", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableHeadersRow();
+
+                    for (int i = 0; i < (int)dumpedImagesList.size(); ++i) {
+                        const auto& img = dumpedImagesList[i];
+                        ImGui::TableNextRow();
+                        ImGui::PushID(i);
+
+                        bool isSel = (selectedDumpedImageIdx == i);
+                        ImGui::TableSetColumnIndex(0);
+                        char rowLabel[260];
+                        sprintf_s(rowLabel, sizeof(rowLabel), "%s##img_%d", img.fileName.c_str(), i);
+                        if (ImGui::Selectable(rowLabel, isSel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                            selectedDumpedImageIdx = i;
+                            RefreshImageExplorer();
+                        }
+
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(img.detectedType.c_str());
+
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("%.2f MB", img.sizeMB);
+
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(img.lastWriteStr.c_str());
+
+                        ImGui::PopID();
+                    }
+                    ImGui::EndTable();
+                }
+
+                ImGui::Spacing();
+
+                if (!imgDirHistory.empty()) {
+                    if (ImGui::Button(".. / Up Folder")) {
+                        ImgNavHistoryItem prev = imgDirHistory.back();
+                        imgDirHistory.pop_back();
+                        currentImgDirCluster = prev.cluster;
+                        currentImgDirPath = prev.path;
+                        activeImgIsFat16Root = prev.isFat16Root;
+                        selectedImgEntryIdx = -1;
+                        currentImgEntries = ListImageDirectory(activeImgFsCtx, currentImgDirCluster, currentImgDirPath, activeImgIsFat16Root);
+                    }
+                    ImGui::SameLine();
+                }
+
+                ImGui::TextColored(themes[currentThemeIndex].accentColor, "Path: %s", currentImgDirPath.c_str());
+                ImGui::Spacing();
+
+                ImGuiTableFlags fsTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+
+                if (ImGui::BeginTable("ImageFsEntriesTable", 4, fsTableFlags, ImVec2(0, 320))) {
+                    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 2.5f);
+                    ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                    ImGui::TableSetupColumn("Size (Bytes)", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+                    ImGui::TableSetupColumn("Start Cluster", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableHeadersRow();
+
+                    for (int i = 0; i < (int)currentImgEntries.size(); ++i) {
+                        const auto& entry = currentImgEntries[i];
+                        if (strlen(imgFileFilter) > 0) {
+                            std::string lowerName = entry.name;
+                            std::string lowerFilter = imgFileFilter;
+                            for (char& c : lowerName) c = (char)std::tolower((unsigned char)c);
+                            for (char& c : lowerFilter) c = (char)std::tolower((unsigned char)c);
+                            if (lowerName.find(lowerFilter) == std::string::npos) continue;
+                        }
+
+                        ImGui::TableNextRow();
+                        ImGui::PushID(10000 + i);
+
+                        bool isEntrySel = (selectedImgEntryIdx == i);
+                        ImGui::TableSetColumnIndex(0);
+                        char entryLabel[280];
+                        sprintf_s(entryLabel, sizeof(entryLabel), "%s%s##fs_%d",
+                                entry.isDirectory ? "[DIR] " : "",
+                                entry.name.c_str(),
+                                i);
+
+                        if (ImGui::Selectable(entryLabel, isEntrySel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                            selectedImgEntryIdx = i;
+                            if (entry.isDirectory && entry.firstCluster >= 2) {
+                                imgDirHistory.push_back({ currentImgDirCluster, currentImgDirPath, activeImgIsFat16Root });
+                                currentImgDirCluster = entry.firstCluster;
+                                currentImgDirPath = entry.fullPath;
+                                activeImgIsFat16Root = false;
+                                selectedImgEntryIdx = -1;
+                                currentImgEntries = ListImageDirectory(activeImgFsCtx, currentImgDirCluster, currentImgDirPath, false);
+                            }
+                        }
+
+                        ImGui::TableSetColumnIndex(1);
+                        if (entry.isDirectory) {
+                            ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "Folder");
+                        } else {
+                            ImGui::TextColored(ImVec4(0.1f, 0.9f, 0.4f, 1.0f), "File");
+                        }
+
+                        ImGui::TableSetColumnIndex(2);
+                        if (entry.isDirectory) {
+                            ImGui::TextUnformatted("-");
+                        } else {
+                            ImGui::Text("%llu", (unsigned long long)entry.sizeBytes);
+                        }
+
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::Text("%u", entry.firstCluster);
+
+                        ImGui::PopID();
+                    }
+
+                    ImGui::EndTable();
+                }
+
+                ImGui::EndTabItem();
+            }
+
             // TAB USB HISTORY
+            static int selectedUSBIndex = -1;
+            static int lastQueriedUSBIndex = -1;
+            static bool lastQueriedConnectedState = false;
+            static SelectedUSBDetails currentUSBDetails;
+            static bool openRepairConfirmModal = false;
+            static bool openDumpModal = false;
+            static bool dumpModalInitialized = false;
+            static std::vector<USBPartitionInfo> modalPartitions;
+            static int selectedPartitionIdx = 0;
+            static bool isDumpingUSB = false;
+            static std::string usbDumpStatus = "Idle";
+            static ULONGLONG lastUSBRefreshTick = 0;
+
             if (ImGui::BeginTabItem("USB History", NULL, (currentTab == 2 ? itemFlags : 0))) {
                 ImGui::Spacing();
-                
-                cachedUSBHistory = LoadUSBHistory();
+
+                ULONGLONG nowTick = GetTickCount64();
+                if (lastUSBRefreshTick == 0 || (nowTick - lastUSBRefreshTick) >= 1000) {
+                    std::string prevSelectedSerial = (selectedUSBIndex >= 0 && selectedUSBIndex < (int)cachedUSBHistory.size())
+                        ? cachedUSBHistory[selectedUSBIndex].serialNumber
+                        : "";
+
+                    std::vector<USBHistoryEntry> freshHistory = LoadUSBHistory();
+                    lastUSBRefreshTick = nowTick;
+
+                    int newSelectedIndex = -1;
+                    if (!prevSelectedSerial.empty()) {
+                        for (size_t idx = 0; idx < freshHistory.size(); ++idx) {
+                            if (freshHistory[idx].serialNumber == prevSelectedSerial) {
+                                newSelectedIndex = (int)idx;
+                                break;
+                            }
+                        }
+                    }
+
+                    bool selectionChanged = (newSelectedIndex != selectedUSBIndex);
+                    bool connectionChanged = false;
+                    if (newSelectedIndex >= 0 && selectedUSBIndex >= 0 && selectedUSBIndex < (int)cachedUSBHistory.size()) {
+                        connectionChanged = (freshHistory[newSelectedIndex].isConnected != cachedUSBHistory[selectedUSBIndex].isConnected);
+                    }
+
+                    cachedUSBHistory = std::move(freshHistory);
+                    selectedUSBIndex = newSelectedIndex;
+
+                    if (selectedUSBIndex < 0) {
+                        lastQueriedUSBIndex = -1;
+                        currentUSBDetails = SelectedUSBDetails{};
+                    } else if (selectionChanged || connectionChanged) {
+                        lastQueriedUSBIndex = -1;
+                    }
+                }
 
                 ImGui::TextColored(themes[currentThemeIndex].accentColor, "Connected USB Devices Artifacts (Registry Audit)");
                 ImGui::SameLine();
                 ImGui::Text(" | TOTAL: %zu", cachedUSBHistory.size());
-                ImGui::SameLine(winWidth - 140);
+
+                ImGui::SameLine(winWidth - 570);
+
                 if (ImGui::Button("Refresh USB")) {
                     cachedUSBHistory = LoadUSBHistory();
+                    lastUSBRefreshTick = GetTickCount64();
+                    selectedUSBIndex = -1;
+                    lastQueriedUSBIndex = -1;
+                    lastQueriedConnectedState = false;
+                    currentUSBDetails = SelectedUSBDetails{};
                 }
+
+                ImGui::SameLine();
+                bool hasSelection = (selectedUSBIndex >= 0 && selectedUSBIndex < (int)cachedUSBHistory.size());
+                bool canAnalyze = hasSelection && !isScanning && !isRepairingUSB && !isDumpingUSB;
+
+                if (!canAnalyze) {
+                    ImGui::BeginDisabled();
+                }
+
+                if (ImGui::Button("Full Sector Scan")) {
+                    const auto& selectedUSB = cachedUSBHistory[selectedUSBIndex];
+                    StartAsyncUSBAnalysis(selectedUSB.serialNumber);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Dump MBR / Part")) {
+                    dumpModalInitialized = false;
+                    openDumpModal = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Repair USB")) {
+                    openRepairConfirmModal = true;
+                }
+
+                if (!canAnalyze) {
+                    ImGui::EndDisabled();
+                }
+
+                if (openRepairConfirmModal) {
+                    ImGui::OpenPopup("Confirm USB Repair");
+                    openRepairConfirmModal = false;
+                }
+
+                if (ImGui::BeginPopupModal("Confirm USB Repair", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    if (hasSelection) {
+                        const auto& targetUSB = cachedUSBHistory[selectedUSBIndex];
+                        ImGui::Text("Run filesystem repair (chkdsk /f) on selected USB device?");
+                        ImGui::Spacing();
+                        ImGui::TextColored(themes[currentThemeIndex].accentColor, "Device: %s", targetUSB.friendlyName.c_str());
+                        ImGui::Text("Serial: %s", targetUSB.serialNumber.c_str());
+                        ImGui::Spacing();
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "Warning: This modifies filesystem structures if errors are present.");
+                    }
+
+                    ImGui::Spacing();
+                    if (ImGui::Button("Confirm", ImVec2(120, 0))) {
+                        if (hasSelection) {
+                            StartAsyncUSBRepair(cachedUSBHistory[selectedUSBIndex].serialNumber);
+                        }
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+
+                if (openDumpModal) {
+                    ImGui::OpenPopup("Dump MBR or Partition");
+                    openDumpModal = false;
+                }
+
+                if (ImGui::BeginPopupModal("Dump MBR or Partition", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    if (hasSelection) {
+                        const auto& targetUSB = cachedUSBHistory[selectedUSBIndex];
+                        if (!dumpModalInitialized) {
+                            modalPartitions = EnumerateUSBPartitions(targetUSB.serialNumber);
+                            selectedPartitionIdx = 0;
+                            dumpModalInitialized = true;
+                        }
+
+                        ImGui::TextColored(themes[currentThemeIndex].accentColor, "Device: %s", targetUSB.friendlyName.c_str());
+                        ImGui::Text("Serial: %s", targetUSB.serialNumber.c_str());
+                        ImGui::Separator();
+
+                        if (ImGui::Button("Dump MBR (First 512 Bytes)", ImVec2(240, 0))) {
+                            std::string outPath;
+                            if (DumpUSBMBR(targetUSB.serialNumber, &outPath)) {
+                                usbDumpStatus = "MBR dumped to " + outPath;
+                            } else {
+                                usbDumpStatus = "Failed to dump MBR.";
+                            }
+                            ImGui::CloseCurrentPopup();
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Text("Or dump a specific partition (e.g., Ventoy data or EFI partition):");
+
+                        if (modalPartitions.empty()) {
+                            ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f), "No partitions detected or drive not accessible.");
+                        } else {
+                            if (selectedPartitionIdx >= (int)modalPartitions.size()) {
+                                selectedPartitionIdx = 0;
+                            }
+                            const auto& curPart = modalPartitions[selectedPartitionIdx];
+                            char comboPreview[128];
+                            sprintf_s(comboPreview, sizeof(comboPreview), "Partition #%lu (%s, %.2f GB)",
+                                    (unsigned long)curPart.partitionNumber,
+                                    curPart.styleName.c_str(),
+                                    curPart.sizeGB);
+
+                            if (ImGui::BeginCombo("Partition", comboPreview)) {
+                                for (int pIdx = 0; pIdx < (int)modalPartitions.size(); ++pIdx) {
+                                    const auto& p = modalPartitions[pIdx];
+                                    char itemLabel[128];
+                                    sprintf_s(itemLabel, sizeof(itemLabel), "Partition #%lu (%s, %.2f GB)##part_%d",
+                                            (unsigned long)p.partitionNumber,
+                                            p.styleName.c_str(),
+                                            p.sizeGB,
+                                            pIdx);
+                                    bool isPartSel = (selectedPartitionIdx == pIdx);
+                                    if (ImGui::Selectable(itemLabel, isPartSel)) {
+                                        selectedPartitionIdx = pIdx;
+                                    }
+                                    if (isPartSel) {
+                                        ImGui::SetItemDefaultFocus();
+                                    }
+                                }
+                                ImGui::EndCombo();
+                            }
+
+                            ImGui::Spacing();
+                            if (ImGui::Button("Dump Selected Partition (.img)", ImVec2(240, 0)) && !isDumpingUSB) {
+                                std::string serialCopy = targetUSB.serialNumber;
+                                DWORD partNumCopy = modalPartitions[selectedPartitionIdx].partitionNumber;
+                                isDumpingUSB = true;
+                                usbDumpStatus = "Dumping partition #" + std::to_string(partNumCopy) + "...";
+
+                                std::thread([serialCopy, partNumCopy]() {
+                                    std::string outFile;
+                                    std::string statusMsg;
+                                    DumpUSBPartition(serialCopy, partNumCopy, &outFile, &statusMsg);
+                                    usbDumpStatus = statusMsg;
+                                    isDumpingUSB = false;
+                                }).detach();
+
+                                ImGui::CloseCurrentPopup();
+                            }
+                        }
+                    }
+
+                    ImGui::Spacing();
+                    if (ImGui::Button("Close", ImVec2(120, 0))) {
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
+
                 ImGui::Spacing();
 
-                float tableHeight = (float)winHeight - 240.0f;
+                if (isScanning) {
+                    float progress = (totalSectorsCount > 0) ? (float)((double)scannedSectorsCount / (double)totalSectorsCount) : 0.0f;
+                    char progressOverlay[128];
+                    sprintf_s(progressOverlay, sizeof(progressOverlay), "Scanning: %llu / %llu sectors (%.1f%%)",
+                            (unsigned long long)scannedSectorsCount,
+                            (unsigned long long)totalSectorsCount,
+                            progress * 100.0f);
+
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "[*] %s", scanStatusMessage.c_str());
+                    ImGui::ProgressBar(progress, ImVec2(-1.0f, 0.0f), progressOverlay);
+                } else if (isDumpingUSB) {
+                    ULONGLONG curBytes = dumpBytesWritten.load(std::memory_order_relaxed);
+                    ULONGLONG totBytes = dumpBytesTotal.load(std::memory_order_relaxed);
+                    float dumpProgress = (totBytes > 0) ? (float)((double)curBytes / (double)totBytes) : 0.0f;
+                    double curMB = (double)curBytes / (1024.0 * 1024.0);
+                    double totMB = (double)totBytes / (1024.0 * 1024.0);
+
+                    char dumpOverlay[160];
+                    sprintf_s(dumpOverlay, sizeof(dumpOverlay), "Dumping: %.1f / %.1f MB (%.1f%%)",
+                            curMB, totMB, dumpProgress * 100.0f);
+
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "[Dump]: %s", usbDumpStatus.c_str());
+                    ImGui::ProgressBar(dumpProgress, ImVec2(-1.0f, 0.0f), dumpOverlay);
+                } else if (usbDumpStatus != "Idle") {
+                    ImGui::TextColored(ImVec4(0.3f, 0.85f, 1.0f, 1.0f), "[Dump]: %s", usbDumpStatus.c_str());
+                } else if (isRepairingUSB || usbRepairStatus != "Idle") {
+                    ImVec4 repairColor = isRepairingUSB ? ImVec4(1.0f, 0.8f, 0.0f, 1.0f) : ImVec4(0.2f, 0.9f, 0.6f, 1.0f);
+                    ImGui::TextColored(repairColor, "[Repair]: %s", usbRepairStatus.c_str());
+                } else if (hasSelection) {
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "[Selected USB]: %s (%s)",
+                        cachedUSBHistory[selectedUSBIndex].friendlyName.c_str(),
+                        cachedUSBHistory[selectedUSBIndex].serialNumber.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "[!] Click a row in the table to select a USB device for physical analysis.");
+                }
+
+                ImGui::Spacing();
+
+                float detailsPanelHeight = hasSelection ? 95.0f : 0.0f;
+                float tableHeight = (float)winHeight - 345.0f - detailsPanelHeight;
+                if (tableHeight < 120.0f) tableHeight = 120.0f;
+
                 ImGuiTableFlags usbTableFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
 
-                if (ImGui::BeginTable("USBHistoryTable", 4, usbTableFlags, ImVec2(0, tableHeight))) {
+                if (ImGui::BeginTable("USBHistoryTable", 5, usbTableFlags, ImVec2(0, tableHeight))) {
                     ImGui::TableSetupColumn("Friendly Name", ImGuiTableColumnFlags_WidthFixed, 180.0f);
                     ImGui::TableSetupColumn("Device Category / Vendor", ImGuiTableColumnFlags_WidthStretch, 2.0f);
                     ImGui::TableSetupColumn("Serial Number / Instance ID", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-                    ImGui::TableSetupColumn("Last Activity", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                    ImGui::TableSetupColumn("Last Activity", ImGuiTableColumnFlags_WidthFixed, 155.0f);
                     ImGui::TableHeadersRow();
 
                     for (size_t i = 0; i < cachedUSBHistory.size(); ++i) {
                         const auto& usb = cachedUSBHistory[i];
                         ImGui::TableNextRow();
-                        
-                        ImGui::TableSetColumnIndex(0); 
-                        ImGui::Text("%s", usb.friendlyName.c_str());
-                        
-                        ImGui::TableSetColumnIndex(1); 
+
+                        ImGui::PushID((int)i);
+
+                        bool isSelected = (selectedUSBIndex == (int)i);
+
+                        ImGui::TableSetColumnIndex(0);
+                        char labelBuf[256];
+                        sprintf_s(labelBuf, sizeof(labelBuf), "%s##row_%zu", usb.friendlyName.c_str(), i);
+
+                        if (ImGui::Selectable(labelBuf, isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                            if (selectedUSBIndex != (int)i) {
+                                selectedUSBIndex = (int)i;
+                                lastQueriedUSBIndex = -1;
+                            }
+                        }
+
+                        ImGui::TableSetColumnIndex(1);
                         ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "%s", usb.deviceName.c_str());
-                        
-                        ImGui::TableSetColumnIndex(2); 
+
+                        ImGui::TableSetColumnIndex(2);
                         ImGui::Text("%s", usb.serialNumber.c_str());
-                        
-                        ImGui::TableSetColumnIndex(3); 
+
+                        ImGui::TableSetColumnIndex(3);
+                        if (usb.isConnected) {
+                            ImGui::TextColored(ImVec4(0.1f, 0.9f, 0.4f, 1.0f), "CONNECTED");
+                        } else {
+                            ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1.0f), "Offline");
+                        }
+
+                        ImGui::TableSetColumnIndex(4);
                         ImGui::Text("%s", usb.installDate.c_str());
+
+                        ImGui::PopID();
                     }
 
                     ImGui::EndTable();
-                    
                 }
+
+                if (hasSelection) {
+                    const auto& sel = cachedUSBHistory[selectedUSBIndex];
+                    if (selectedUSBIndex != lastQueriedUSBIndex || sel.isConnected != lastQueriedConnectedState) {
+                        currentUSBDetails = SelectedUSBDetails{};
+                        currentUSBDetails = QuerySelectedUSBDetails(sel);
+                        lastQueriedUSBIndex = selectedUSBIndex;
+                        lastQueriedConnectedState = sel.isConnected;
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::BeginChild("SelectedUSBDetailsBox", ImVec2(0, detailsPanelHeight), true);
+                    ImGui::TextColored(themes[currentThemeIndex].accentColor, "Selected Device Details");
+                    ImGui::SameLine();
+                    ImGui::Text("| Name: %s | Serial: %s", sel.friendlyName.c_str(), sel.serialNumber.c_str());
+
+                    if (currentUSBDetails.resolved && currentUSBDetails.physicalDriveIndex >= 0) {
+                        ImGui::Text("Physical Drive: \\\\.\\PhysicalDrive%d  |  Volume: %s",
+                            currentUSBDetails.physicalDriveIndex,
+                            currentUSBDetails.driveLetter.c_str());
+                        ImGui::Text("Capacity: %.2f GB  |  Total Sectors: %llu  |  Sector Size: %u Bytes",
+                            currentUSBDetails.capacityGB,
+                            currentUSBDetails.totalSectors,
+                            currentUSBDetails.sectorSize);
+                    } else if (currentUSBDetails.isConnected) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                            "Device is connected, but its physical drive / geometry could not be resolved.");
+                    } else {
+                        ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f),
+                            "Device is currently disconnected. Physical drive index, volume letter, and geometry are available when connected.");
+                    }
+                    ImGui::EndChild();
+                }
+
                 ImGui::EndTabItem();
             }
 
@@ -9593,12 +12327,43 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(250);
                 ImGui::InputText("##search", searchBuffer, sizeof(searchBuffer));
+
+                ImGui::SameLine();
+                if (ImGui::Button("Columns Config")) {
+                    ImGui::OpenPopup("ColumnsSettingsPopup");
+                }
+
+                ImGui::SameLine();
+                if (ImGui::Button("Export HTML Report")) {
+                    if (ExportForensicHtmlReport(cachedProcesses)) {
+                        ImGui::OpenPopup("ExportSuccessPopup");
+                    }
+                }
+
+                if (ImGui::BeginPopup("ColumnsSettingsPopup")) {
+                    ImGui::TextUnformatted("Manage Table Columns");
+                    ImGui::Separator();
+                    ImGui::TextDisabled("(Tip: You can also right-click\non any table header to toggle columns)");
+                    ImGui::EndPopup();
+                }
+
+                if (ImGui::BeginPopupModal("ExportSuccessPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                    ImGui::Text("HTML Forensic Report exported successfully!");
+                    ImGui::Separator();
+                    if (ImGui::Button("OK", ImVec2(120, 0))) {
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::EndPopup();
+                }
                 
                 ImGui::Spacing();
                 float tableHeight = (float)winHeight - 190.0f;
 
-                if (ImGui::BeginTable("ProcessTable", 9, ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable, ImVec2(0, tableHeight))) {
-                    ImGui::TableSetupColumn("NAME", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+                ImGuiTableFlags tableFlags = ImGuiTableFlags_BordersV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | 
+                                            ImGuiTableFlags_Resizable | ImGuiTableFlags_Hideable | ImGuiTableFlags_Reorderable;
+
+                if (ImGui::BeginTable("ProcessTable", 10, tableFlags, ImVec2(0, tableHeight))) {
+                    ImGui::TableSetupColumn("NAME", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoHide, 2.0f);
                     ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 70.0f);
                     ImGui::TableSetupColumn("RISK", ImGuiTableColumnFlags_WidthFixed, 75.0f);
                     ImGui::TableSetupColumn("CPU (%)", ImGuiTableColumnFlags_WidthFixed, 70.0f);
@@ -9606,6 +12371,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                     ImGui::TableSetupColumn("PRIORITY", ImGuiTableColumnFlags_WidthFixed, 90.0f);
                     ImGui::TableSetupColumn("STATUS / SPOOFING", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                     ImGui::TableSetupColumn("SIGNATURE", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                    ImGui::TableSetupColumn("PRIVILEGES", ImGuiTableColumnFlags_WidthFixed, 100.0f);
                     ImGui::TableSetupColumn("PATH", ImGuiTableColumnFlags_WidthStretch, 3.0f);
                     ImGui::TableHeadersRow();
 
@@ -9614,13 +12380,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                     for (const auto& p : cachedProcesses) {
                         RenderProcessTreeRow(p, filterStr, selectedPid, hwnd, 
-                                                memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
-                                                modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
-                                                connectionsPid, showConnections, cachedConnections, connectionsError,
-                                                handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
-                                                cachedProcesses,
-                                                monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick
-                                                );
+                                            memoryMapPid, showMemoryMap, cachedMemoryRegions, memoryMapError,
+                                            modThreadsPid, showModulesThreads, cachedModules, modulesError, cachedThreads, threadsError,
+                                            connectionsPid, showConnections, cachedConnections, connectionsError,
+                                            handlesDllsPid, showHandlesDlls, cachedHandles, handlesError, cachedAdvancedModules, advancedModulesError, isHandlesDllsLoading,
+                                            cachedProcesses,
+                                            monitoredPid, hMonitoredProcess, isTracking, liveCpuHistory, liveMemHistory, liveHistoryIndex, lastLiveTick
+                                            );
                     }
                     ImGui::EndTable();
                 }
@@ -13295,7 +16061,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         }
 
         if (showModulesThreads) {
-            ImGui::SetNextWindowSize(ImVec2(820, 560), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(960, 560), ImGuiCond_FirstUseEver);
             if (ImGui::Begin("Modules & Threads Inspector", &showModulesThreads)) {
                 if (ImGui::BeginTabBar("ModThreadTabs")) {
                     if (ImGui::BeginTabItem("Modules (DLLs)")) {
@@ -13344,7 +16110,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                     ImGui::Selectable(rowId, isSelected, ImGuiSelectableFlags_SpanAllColumns);
 
                                     if (ImGui::BeginPopupContextItem()) {
-                                        static ModuleInfoItem selectedModuleForInspection = mod;
+                                        static ModuleInfoItem selectedModuleForInspection;
                                         selectedModuleForInspection = mod;
 
                                         if (ImGui::MenuItem("Copy Module Path")) {
@@ -13379,10 +16145,11 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                             ImGui::TextDisabled("(Active: %zu)", cachedThreads.size());
                             ImGui::Spacing();
 
-                            if (ImGui::BeginTable("ThreadTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 390))) {
-                                ImGui::TableSetupColumn("Thread ID (TID)", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                                ImGui::TableSetupColumn("Process ID (PID)", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                                ImGui::TableSetupColumn("Base Priority", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                            if (ImGui::BeginTable("ThreadTable", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0, 390))) {
+                                ImGui::TableSetupColumn("Thread ID (TID)", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                                ImGui::TableSetupColumn("Process ID (PID)", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                                ImGui::TableSetupColumn("Base Priority", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                                ImGui::TableSetupColumn("Start Address (Entry)", ImGuiTableColumnFlags_WidthStretch, 1.0f);
                                 ImGui::TableHeadersRow();
 
                                 std::string threadFilterStr(threadFilter);
@@ -13406,6 +16173,13 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
                                     
                                     ImGui::TableSetColumnIndex(2); 
                                     ImGui::Text("%ld", th.basePri);
+
+                                    ImGui::TableSetColumnIndex(3);
+                                    if (th.startAddress != 0) {
+                                        ImGui::Text("0x%016llX", th.startAddress);
+                                    } else {
+                                        ImGui::TextDisabled("Unknown / Restricted");
+                                    }
                                 }
                                 ImGui::EndTable();
                             }
